@@ -546,6 +546,12 @@ func (d *Decompressor) MadvWillNeed() *Decompressor {
 
 // Getter represent "reader" or "iterator" that can move across the data of the decompressor
 // The full state of the getter can be captured by saving dataP, and dataBit
+// patternPos records the position and length of a pattern placed during decompression.
+type patternPos struct {
+	bufPos int
+	patLen int
+}
+
 type Getter struct {
 	patternDict *patternTable
 	posDict     *posTable
@@ -555,6 +561,8 @@ type Getter struct {
 	dataBit     int // Value 0..7 - position of the bit
 	trace       bool
 	d           *Decompressor
+	buf         []byte       // reusable buffer for MatchCmp
+	positions   []patternPos // reusable slice for single-pass decompression
 }
 
 func (g *Getter) MadvNormal() MadvDisabler {
@@ -719,36 +727,30 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 		buf = buf[:len(buf)+int(wordLen)]
 	}
 
-	// Loop below fills in the patterns
-	// Tracking position in buf where to insert part of the word
+	// Single pass: fill patterns and record their positions
+	g.positions = g.positions[:0]
 	bufPos := bufOffset
 	for pos := g.nextPos(false /* clean */); pos != 0; pos = g.nextPos(false) {
 		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
 		pt := g.nextPattern()
 		copy(buf[bufPos:], pt)
+		g.positions = append(g.positions, patternPos{bufPos: bufPos, patLen: len(pt)})
 	}
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
 	postLoopPos := g.dataP
-	g.dataP = savePos
-	g.dataBit = 0
-	g.nextPos(true /* clean */) // Reset the state of huffman reader
 
-	// Restore to the beginning of buf
-	bufPos = bufOffset
+	// Fill uncovered gaps from raw data (no second Huffman traversal)
 	lastUncovered := bufOffset
-
-	// Loop below fills the data which is not in the patterns
-	for pos := g.nextPos(false); pos != 0; pos = g.nextPos(false) {
-		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
-		if bufPos > lastUncovered {
-			dif := uint64(bufPos - lastUncovered)
-			copy(buf[lastUncovered:bufPos], g.data[postLoopPos:postLoopPos+dif])
+	for _, pp := range g.positions {
+		if pp.bufPos > lastUncovered {
+			dif := uint64(pp.bufPos - lastUncovered)
+			copy(buf[lastUncovered:pp.bufPos], g.data[postLoopPos:postLoopPos+dif])
 			postLoopPos += dif
 		}
-		lastUncovered = bufPos + len(g.nextPattern())
+		lastUncovered = pp.bufPos + pp.patLen
 	}
 	if bufOffset+int(wordLen) > lastUncovered {
 		dif := uint64(bufOffset + int(wordLen) - lastUncovered)
@@ -938,33 +940,38 @@ func (g *Getter) MatchCmp(buf []byte) int {
 		return 0
 	}
 
-	decoded := make([]byte, wordLen)
+	if uint64(cap(g.buf)) < wordLen {
+		g.buf = make([]byte, wordLen)
+	} else {
+		g.buf = g.buf[:wordLen]
+		clear(g.buf)
+	}
+	decoded := g.buf
+
+	// Single pass: fill patterns and record their positions
+	g.positions = g.positions[:0]
 	var bufPos int
-	// In the first pass, we only check patterns
 	for pos := g.nextPos(false /* clean */); pos != 0; pos = g.nextPos(false) {
 		bufPos += int(pos) - 1
 		pattern := g.nextPattern()
 		copy(decoded[bufPos:], pattern)
+		g.positions = append(g.positions, patternPos{bufPos: bufPos, patLen: len(pattern)})
 	}
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
 	postLoopPos := g.dataP
-	g.dataP, g.dataBit = savePos, 0
-	g.nextPos(true /* clean */) // Reset the state of huffman decoder
-	// Second pass - we check spaces not covered by the patterns
+
+	// Fill uncovered gaps from raw data (no second Huffman traversal)
 	var lastUncovered int
-	bufPos = 0
-	for pos := g.nextPos(false /* clean */); pos != 0; pos = g.nextPos(false) {
-		bufPos += int(pos) - 1
-		// fmt.Printf("BUF POS: %d, POS: %d, lastUncovered: %d\n", bufPos, pos, lastUncovered)
-		if bufPos > lastUncovered {
-			dif := uint64(bufPos - lastUncovered)
-			copy(decoded[lastUncovered:bufPos], g.data[postLoopPos:postLoopPos+dif])
+	for _, pp := range g.positions {
+		if pp.bufPos > lastUncovered {
+			dif := uint64(pp.bufPos - lastUncovered)
+			copy(decoded[lastUncovered:pp.bufPos], g.data[postLoopPos:postLoopPos+dif])
 			postLoopPos += dif
 		}
-		lastUncovered = bufPos + len(g.nextPattern())
+		lastUncovered = pp.bufPos + pp.patLen
 	}
 
 	if int(wordLen) > lastUncovered {
