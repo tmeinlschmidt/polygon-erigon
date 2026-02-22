@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +118,19 @@ func DirtySpace() uint64 {
 		}
 	})
 	return dirtySace
+}
+
+// DirtySpaceForLabel returns per-database dirty space override via
+// env var MDBX_DIRTY_SPACE_MB_<LABEL>, falling back to DirtySpace().
+func DirtySpaceForLabel(label string) uint64 {
+	envKey := "MDBX_DIRTY_SPACE_MB_" + strings.ToUpper(label)
+	v, _ := os.LookupEnv(envKey)
+	if v != "" {
+		i := MustParseInt(v)
+		log.Info("[Experiment]", envKey, i)
+		return uint64(i * 1024 * 1024)
+	}
+	return DirtySpace()
 }
 
 func MergeTr() int { return mergeTr }
