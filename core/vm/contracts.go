@@ -31,6 +31,7 @@ import (
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fp"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
+	"github.com/elastic/go-freelru"
 	patched_big "github.com/ethereum/go-bigmodexpfix/src/math/big"
 	"github.com/holiman/uint256"
 
@@ -420,6 +421,11 @@ func RunPrecompiledContract(p PrecompiledContract, input []byte, suppliedGas uin
 	return output, suppliedGas, err
 }
 
+// ecrecoverCache caches ecrecover results to avoid repeated secp256k1 recovery (~400us each).
+var ecrecoverCache, _ = freelru.NewSharded[[128]byte, [32]byte](1024, func(k [128]byte) uint32 {
+	return binary.LittleEndian.Uint32(k[:4])
+})
+
 // ECRECOVER implemented as a native contract.
 type ecrecover struct{}
 
@@ -431,6 +437,14 @@ func (c *ecrecover) Run(input []byte) ([]byte, error) {
 	const ecRecoverInputLength = 128
 
 	input = common.RightPadBytes(input, ecRecoverInputLength)
+
+	// Check cache first - same (hash, v, r, s) always produces same address
+	var cacheKey [128]byte
+	copy(cacheKey[:], input[:128])
+	if cached, ok := ecrecoverCache.Get(cacheKey); ok {
+		return cached[:], nil
+	}
+
 	// "input" is (hash, v, r, s), each 32 bytes
 	// but for ecrecover we want (r, s, v)
 
@@ -455,7 +469,14 @@ func (c *ecrecover) Run(input []byte) ([]byte, error) {
 	}
 
 	// the first byte of pubkey is bitcoin heritage
-	return common.LeftPadBytes(crypto.Keccak256(pubKey[1:])[12:], 32), nil
+	result := common.LeftPadBytes(crypto.Keccak256(pubKey[1:])[12:], 32)
+
+	// Cache the result
+	var cacheVal [32]byte
+	copy(cacheVal[:], result)
+	ecrecoverCache.Add(cacheKey, cacheVal)
+
+	return result, nil
 }
 
 func (c *ecrecover) Name() string {
