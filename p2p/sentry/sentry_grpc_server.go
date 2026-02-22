@@ -1473,15 +1473,29 @@ func (ss *GrpcServer) send(msgID sentryproto.MessageId, peerID [64]byte, b []byt
 	}
 	for i := range ss.messageStreams[msgID] {
 		ch := ss.messageStreams[msgID][i]
-		ch <- req
-		if len(ch) > MessagesQueueSize/2 {
-			ss.logger.Debug("[sentry] consuming is slow, drop 50% of old messages", "msgID", msgID.String())
-			// evict old messages from channel
+		select {
+		case ch <- req:
+			if len(ch) > MessagesQueueSize/2 {
+				ss.logger.Debug("[sentry] consuming is slow, drop 25% of old messages", "msgID", msgID.String())
+				for j := 0; j < MessagesQueueSize/4; j++ {
+					select {
+					case <-ch:
+					default:
+					}
+				}
+			}
+		default:
+			// Channel full — evict oldest to make room, avoid HOL blocking
 			for j := 0; j < MessagesQueueSize/4; j++ {
 				select {
 				case <-ch:
 				default:
 				}
+			}
+			ss.logger.Debug("[sentry] slow subscriber, evicted old messages", "msgID", msgID.String())
+			select {
+			case ch <- req:
+			default:
 			}
 		}
 	}
