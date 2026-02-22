@@ -24,7 +24,7 @@ import (
 var defaultFetcherConfig = FetcherConfig{
 	responseTimeout:    10 * time.Second,
 	retryBackOff:       time.Second,
-	maxRetries:         1,
+	maxRetries:         3,
 	requestIdGenerator: rand.Uint64,
 }
 
