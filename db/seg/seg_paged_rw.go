@@ -21,11 +21,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/erigontech/erigon/db/compress"
 )
 
 var be = binary.BigEndian
+var pagePool = sync.Pool{New: func() any { return &Page{} }}
 
 func GetFromPage(key, compressedPage []byte, compressionBuf []byte, compressionEnabled bool) (v []byte, compressionBufOut []byte) {
 	var err error
@@ -72,7 +74,7 @@ type Page struct {
 }
 
 func FromBytes(buf []byte, compressionEnabled bool) *Page {
-	r := &Page{}
+	r := pagePool.Get().(*Page)
 	r.Reset(buf, compressionEnabled)
 	return r
 }
@@ -104,6 +106,13 @@ func (r *Page) Next() (k, v []byte) {
 	r.kOffset += kLen
 	r.vOffset += vLen
 	return k, v
+}
+
+func (r *Page) Release() {
+	r.kLens, r.vLens, r.data = nil, nil, nil
+	r.i, r.kOffset, r.vOffset = 0, 0, 0
+	r.limit = 0
+	pagePool.Put(r)
 }
 
 func WordsAmount2PagesAmount(wordsAmount int, pageSize int) (pagesAmount int) {
@@ -145,7 +154,8 @@ func (g *PagedReader) Reset(offset uint64) {
 	g.file.Reset(offset)
 	g.currentPageOffset = offset
 	g.nextPageOffset = offset
-	g.page = &Page{} // TODO: optimize
+	g.page.i, g.page.kOffset, g.page.vOffset = 0, 0, 0
+	g.page.limit = 0
 	if g.file.HasNext() {
 		g.NextPage()
 	}
