@@ -160,13 +160,7 @@ func (vm *VM) getReadonly() bool {
 }
 
 func copyJumpTable(jt *JumpTable) *JumpTable {
-	var copy JumpTable
-	for i, op := range jt {
-		if op != nil {
-			opCopy := *op
-			copy[i] = &opCopy
-		}
-	}
+	copy := *jt
 	return &copy
 }
 
@@ -335,7 +329,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		// Get the operation from the jump table and validate the stack to ensure there are
 		// enough stack items available to perform the operation.
 		op = contract.GetOp(_pc)
-		operation := in.jt[op]
+		operation := &in.jt[op]
 		cost = operation.constantGas // For tracing
 		// Validate stack
 		if sLen := locStack.len(); sLen < operation.numPop {
