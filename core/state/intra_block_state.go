@@ -1509,11 +1509,10 @@ func (sdb *IntraBlockState) Prepare(rules *chain.Rules, sender, coinbase common.
 		fmt.Printf("%d (%d.%d) ibs.Prepare: sender: %x, coinbase: %x, dest: %x, %x, %v, %v, %v\n", sdb.blockNum, sdb.txIndex, sdb.version, sender, coinbase, dst, precompiles, list, rules, authorities)
 	}
 	if rules.IsBerlin {
-		// Clear out any leftover from previous executions
-		al := newAccessList()
+		// Return old access list to pool and get a fresh one
+		putAccessList(sdb.accessList)
+		al := getAccessList()
 		sdb.accessList = al
-		//sdb.accessList.Reset()
-		//al := sdb.accessList
 
 		al.AddAddress(sender)
 		if dst != nil {
