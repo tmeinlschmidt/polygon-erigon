@@ -18,7 +18,6 @@ package state
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -528,11 +527,22 @@ func (b *BtIndex) keyCmp(k []byte, di uint64, g *seg.Reader, resBuf []byte) (int
 		return 0, nil, fmt.Errorf("key at %d/%d not found, file: %s", di, b.ef.Count(), b.FileName())
 	}
 
-	resBuf, _ = g.Next(resBuf)
+	if k == nil {
+		// nil key means caller just wants to extract the key at this index
+		resBuf, _ = g.Next(resBuf)
+		return 0, resBuf, nil
+	}
 
-	//TODO: use `b.getter.Match` after https://github.com/erigontech/erigon/issues/7855
-	return bytes.Compare(resBuf, k), resBuf, nil
-	//return b.getter.Match(k), result, nil
+	// MatchCmp compares directly during decompression without full key extraction.
+	// Returns bytes.Compare(k, word); we need bytes.Compare(word, k) so negate.
+	cmp := g.MatchCmp(k)
+	if cmp == 0 {
+		// Exact match: re-read key into resBuf for the caller (happens once per search)
+		g.Reset(offset)
+		resBuf, _ = g.Next(resBuf)
+		return 0, resBuf, nil
+	}
+	return -cmp, resBuf, nil
 }
 
 // getter should be alive all the time of cursor usage
