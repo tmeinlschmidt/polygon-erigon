@@ -148,7 +148,7 @@ type CacheWriteItem interface {
 }
 
 func compare_code_code(i1 *CodeItem, i2 *CodeItem) int {
-	c := bytes.Compare(i1.addrHash.Bytes(), i2.addrHash.Bytes())
+	c := bytes.Compare(i1.addrHash[:], i2.addrHash[:])
 	if c != 0 {
 		return c
 	}
@@ -164,9 +164,9 @@ func compare_code_code(i1 *CodeItem, i2 *CodeItem) int {
 func (r *AccountSeek) Less(than btree.Item) bool {
 	switch i := than.(type) {
 	case *AccountItem:
-		return bytes.Compare(r.seek, i.addrHash.Bytes()) < 0
+		return bytes.Compare(r.seek, i.addrHash[:]) < 0
 	case *AccountWriteItem:
-		return bytes.Compare(r.seek, i.ai.addrHash.Bytes()) < 0
+		return bytes.Compare(r.seek, i.ai.addrHash[:]) < 0
 	default:
 		panic(fmt.Sprintf("unexpected type: %T", than))
 	}
@@ -175,23 +175,23 @@ func (r *AccountSeek) Less(than btree.Item) bool {
 func (r *StorageSeek) Less(than btree.Item) bool {
 	switch i := than.(type) {
 	case *StorageItem:
-		c := bytes.Compare(r.addrHash.Bytes(), i.addrHash.Bytes())
+		c := bytes.Compare(r.addrHash[:], i.addrHash[:])
 		if c != 0 {
 			return c < 0
 		}
 		if r.incarnation < i.incarnation {
 			return true
 		}
-		return bytes.Compare(r.seek, i.locHash.Bytes()) < 0
+		return bytes.Compare(r.seek, i.locHash[:]) < 0
 	case *StorageWriteItem:
-		c := bytes.Compare(r.addrHash.Bytes(), i.si.addrHash.Bytes())
+		c := bytes.Compare(r.addrHash[:], i.si.addrHash[:])
 		if c != 0 {
 			return c < 0
 		}
 		if r.incarnation < i.si.incarnation {
 			return true
 		}
-		return bytes.Compare(r.seek, i.si.locHash.Bytes()) < 0
+		return bytes.Compare(r.seek, i.si.locHash[:]) < 0
 	default:
 		panic(fmt.Sprintf("unexpected type: %T", than))
 	}
@@ -200,11 +200,11 @@ func (r *StorageSeek) Less(than btree.Item) bool {
 func (ai *AccountItem) Less(than btree.Item) bool {
 	switch i := than.(type) {
 	case *AccountItem:
-		return bytes.Compare(ai.addrHash.Bytes(), i.addrHash.Bytes()) < 0
+		return bytes.Compare(ai.addrHash[:], i.addrHash[:]) < 0
 	case *AccountWriteItem:
-		return bytes.Compare(ai.addrHash.Bytes(), i.ai.addrHash.Bytes()) < 0
+		return bytes.Compare(ai.addrHash[:], i.ai.addrHash[:]) < 0
 	case *AccountSeek:
-		return bytes.Compare(ai.addrHash.Bytes(), i.seek) < 0
+		return bytes.Compare(ai.addrHash[:], i.seek) < 0
 	default:
 		panic(fmt.Sprintf("unexpected type: %T", than))
 	}
@@ -245,32 +245,32 @@ func (swi *StorageWriteItem) GetSize() int                { return storageWriteI
 func (si *StorageItem) Less(than btree.Item) bool {
 	switch i := than.(type) {
 	case *StorageItem:
-		c := bytes.Compare(si.addrHash.Bytes(), i.addrHash.Bytes())
+		c := bytes.Compare(si.addrHash[:], i.addrHash[:])
 		if c != 0 {
 			return c < 0
 		}
 		if si.incarnation < i.incarnation {
 			return true
 		}
-		return bytes.Compare(si.locHash.Bytes(), i.locHash.Bytes()) < 0
+		return bytes.Compare(si.locHash[:], i.locHash[:]) < 0
 	case *StorageWriteItem:
-		c := bytes.Compare(si.addrHash.Bytes(), i.si.addrHash.Bytes())
+		c := bytes.Compare(si.addrHash[:], i.si.addrHash[:])
 		if c != 0 {
 			return c < 0
 		}
 		if si.incarnation < i.si.incarnation {
 			return true
 		}
-		return bytes.Compare(si.locHash.Bytes(), i.si.locHash.Bytes()) < 0
+		return bytes.Compare(si.locHash[:], i.si.locHash[:]) < 0
 	case *StorageSeek:
-		c := bytes.Compare(si.addrHash.Bytes(), i.addrHash.Bytes())
+		c := bytes.Compare(si.addrHash[:], i.addrHash[:])
 		if c != 0 {
 			return c < 0
 		}
 		if si.incarnation < i.incarnation {
 			return true
 		}
-		return bytes.Compare(si.locHash.Bytes(), i.seek) < 0
+		return bytes.Compare(si.locHash[:], i.seek) < 0
 	default:
 		panic(fmt.Sprintf("unexpected type: %T", than))
 	}
@@ -301,7 +301,7 @@ func (ci *CodeItem) Less(than btree.Item) bool {
 
 func (cwi *CodeWriteItem) Less(than btree.Item) bool {
 	i := than.(*CodeWriteItem)
-	c := bytes.Compare(cwi.address.Bytes(), i.address.Bytes())
+	c := bytes.Compare(cwi.address[:], i.address[:])
 	if c == 0 {
 		return cwi.ci.incarnation < i.ci.incarnation
 	}
@@ -459,7 +459,7 @@ func (sc *StateCache) HasAccountWithInPrefix(addrHashPrefix []byte) bool {
 	seek := &AccountSeek{seek: addrHashPrefix}
 	var found bool
 	sc.readWrites[id(seek)].AscendGreaterOrEqual(seek, func(i btree.Item) bool {
-		found = bytes.HasPrefix(i.(*AccountItem).addrHash.Bytes(), addrHashPrefix)
+		found = bytes.HasPrefix(i.(*AccountItem).addrHash[:], addrHashPrefix)
 		return false
 	})
 	return found
@@ -582,14 +582,14 @@ func (sc *StateCache) SetAccountRead(address []byte, account *accounts.Account) 
 // hack to set hashed addr - we don't have another one in trie stage
 func (sc *StateCache) DeprecatedSetAccountRead(addrHash common.Hash, account *accounts.Account) {
 	var ai AccountItem
-	ai.addrHash.SetBytes(addrHash.Bytes())
+	ai.addrHash.SetBytes(addrHash[:])
 	ai.account.Copy(account)
 	sc.setRead(&ai, false /* absent */)
 }
 
 func (sc *StateCache) GetAccountByHashedAddress(addrHash common.Hash) (*accounts.Account, bool) {
 	var key AccountItem
-	key.addrHash.SetBytes(addrHash.Bytes())
+	key.addrHash.SetBytes(addrHash[:])
 	if item, ok := sc.get(&key); ok {
 		if item != nil {
 			return &item.(*AccountItem).account, true
@@ -749,9 +749,9 @@ func (sc *StateCache) DeprecatedSetStorageRead(addrHash common.Hash, incarnation
 	var i StorageItem
 	h := common.NewHasher()
 	defer common.ReturnHasherToPool(h)
-	copy(i.addrHash[:], addrHash.Bytes())
+	copy(i.addrHash[:], addrHash[:])
 	i.incarnation = incarnation
-	i.locHash.SetBytes(locHash.Bytes())
+	i.locHash.SetBytes(locHash[:])
 	i.value.SetBytes(val)
 	sc.setRead(&i, false /* absent */)
 }
@@ -759,7 +759,7 @@ func (sc *StateCache) DeprecatedSetStorageRead(addrHash common.Hash, incarnation
 // hack to set hashed addr - we don't have another one in trie stage
 func (sc *StateCache) DeprecatedSetAccountWrite(addrHash common.Hash, account *accounts.Account) {
 	var ai AccountItem
-	copy(ai.addrHash[:], addrHash.Bytes())
+	copy(ai.addrHash[:], addrHash[:])
 	ai.account.Copy(account)
 	var awi AccountWriteItem
 	awi.ai = &ai
@@ -769,7 +769,7 @@ func (sc *StateCache) DeprecatedSetAccountWrite(addrHash common.Hash, account *a
 // hack to set hashed addr - we don't have another one in trie stage
 func (sc *StateCache) DeprecatedSetAccountDelete(addrHash common.Hash) {
 	var ai AccountItem
-	copy(ai.addrHash[:], addrHash.Bytes())
+	copy(ai.addrHash[:], addrHash[:])
 	var awi AccountWriteItem
 	awi.ai = &ai
 	sc.setWrite(&ai, &awi, true /* delete */)
@@ -778,9 +778,9 @@ func (sc *StateCache) DeprecatedSetAccountDelete(addrHash common.Hash) {
 // hack to set hashed addr - we don't have another one in trie stage
 func (sc *StateCache) DeprecatedSetStorageDelete(addrHash common.Hash, incarnation uint64, locHash common.Hash) {
 	var si StorageItem
-	copy(si.addrHash[:], addrHash.Bytes())
+	copy(si.addrHash[:], addrHash[:])
 	si.incarnation = incarnation
-	copy(si.locHash[:], locHash.Bytes())
+	copy(si.locHash[:], locHash[:])
 	var swi StorageWriteItem
 	swi.si = &si
 	sc.setWrite(&si, &swi, true /* delete */)
@@ -789,9 +789,9 @@ func (sc *StateCache) DeprecatedSetStorageDelete(addrHash common.Hash, incarnati
 // hack to set hashed addr - we don't have another one in trie stage
 func (sc *StateCache) DeprecatedSetStorageWrite(addrHash common.Hash, incarnation uint64, locHash common.Hash, v []byte) {
 	var si StorageItem
-	copy(si.addrHash[:], addrHash.Bytes())
+	copy(si.addrHash[:], addrHash[:])
 	si.incarnation = incarnation
-	copy(si.locHash[:], locHash.Bytes())
+	copy(si.locHash[:], locHash[:])
 	si.value.SetBytes(v)
 	var swi StorageWriteItem
 	swi.si = &si
@@ -954,31 +954,31 @@ func WalkWrites(
 			switch it := i.(type) {
 			case *AccountWriteItem:
 				if it.ai.flags&AbsentFlag != 0 {
-					if err = accountDelete(it.address.Bytes(), &it.ai.account); err != nil {
+					if err = accountDelete(it.address[:], &it.ai.account); err != nil {
 						return false
 					}
 				} else {
-					if err = accountWrite(it.address.Bytes(), &it.ai.account); err != nil {
+					if err = accountWrite(it.address[:], &it.ai.account); err != nil {
 						return false
 					}
 				}
 			case *StorageWriteItem:
 				if it.si.flags&AbsentFlag != 0 {
-					if err = storageDelete(it.address.Bytes(), it.si.incarnation, it.location.Bytes()); err != nil {
+					if err = storageDelete(it.address[:], it.si.incarnation, it.location[:]); err != nil {
 						return false
 					}
 				} else {
-					if err = storageWrite(it.address.Bytes(), it.si.incarnation, it.location.Bytes(), it.si.value.Bytes()); err != nil {
+					if err = storageWrite(it.address[:], it.si.incarnation, it.location[:], it.si.value.Bytes()); err != nil {
 						return false
 					}
 				}
 			case *CodeWriteItem:
 				if it.ci.flags&AbsentFlag != 0 {
-					if err = codeDelete(it.address.Bytes(), it.ci.incarnation); err != nil {
+					if err = codeDelete(it.address[:], it.ci.incarnation); err != nil {
 						return false
 					}
 				} else {
-					if err = codeWrite(it.address.Bytes(), it.ci.incarnation, it.ci.code); err != nil {
+					if err = codeWrite(it.address[:], it.ci.incarnation, it.ci.code); err != nil {
 						return false
 					}
 				}
