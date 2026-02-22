@@ -38,8 +38,8 @@ func MmapRw(f *os.File, size int) ([]byte, *[MaxMapSize]byte, error) {
 		return nil, nil, err
 	}
 
-	// Advise the kernel that the mmap is accessed randomly.
-	err = unix.Madvise(mmapHandle1, syscall.MADV_RANDOM)
+	// Advise the kernel to use default readahead for the mmap.
+	err = unix.Madvise(mmapHandle1, syscall.MADV_NORMAL)
 	if err != nil && !errors.Is(err, syscall.ENOSYS) {
 		// Ignore not implemented error in kernel because it still works.
 		return nil, nil, fmt.Errorf("madvise: %w", err)
@@ -54,8 +54,8 @@ func Mmap(f *os.File, size int) ([]byte, *[MaxMapSize]byte, error) {
 		return nil, nil, err
 	}
 
-	// Advise the kernel that the mmap is accessed randomly.
-	err = unix.Madvise(mmapHandle1, syscall.MADV_RANDOM)
+	// Advise the kernel to use default readahead for the mmap.
+	err = unix.Madvise(mmapHandle1, syscall.MADV_NORMAL)
 	if err != nil && !errors.Is(err, syscall.ENOSYS) {
 		// Ignore not implemented error in kernel because it still works.
 		return nil, nil, fmt.Errorf("madvise: %w", err)
