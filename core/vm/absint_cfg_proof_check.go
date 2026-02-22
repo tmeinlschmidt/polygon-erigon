@@ -42,7 +42,7 @@ func NewCfgAbsSem() *CfgAbsSem {
 	sem := CfgAbsSem{}
 
 	for opcode, op := range jt {
-		if op == nil {
+		if op.execute == nil {
 			continue
 		}
 		opsem := CfgOpSem{}

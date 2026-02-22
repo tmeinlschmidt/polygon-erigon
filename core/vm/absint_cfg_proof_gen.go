@@ -45,7 +45,7 @@ type Astmt struct {
 	isBlockExit    bool
 	covered        bool
 	opcode         OpCode
-	operation      *operation
+	operation      operation
 	pc             int
 	numBytes       int
 	value          uint256.Int
@@ -104,7 +104,7 @@ func toProgram(code []byte) *Program {
 		op := OpCode(code[pc])
 		stmt.opcode = op
 		stmt.operation = jt[op]
-		stmt.ends = stmt.operation == nil
+		stmt.ends = stmt.operation.execute == nil
 		//fmt.Printf("%v %v %v", pc, stmt.opcode, stmt.operation.valid)
 
 		if op.IsPushWithImmediateArgs() {

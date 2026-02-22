@@ -75,11 +75,15 @@ var (
 )
 
 // JumpTable contains the EVM opcodes supported at a given fork.
-type JumpTable [256]*operation
+// Uses value semantics (not pointers) so the entire table is a contiguous
+// ~14KB array that fits in L1 cache, eliminating a pointer dereference
+// per opcode dispatch in the interpreter hot loop.
+type JumpTable [256]operation
 
 func validateAndFillMaxStack(jt *JumpTable) {
-	for i, op := range jt {
-		if op == nil {
+	for i := range jt {
+		op := &jt[i]
+		if op.execute == nil {
 			panic(fmt.Sprintf("op 0x%x is not set", i))
 		}
 		// The interpreter has an assumption that if the memorySize function is
@@ -178,31 +182,31 @@ func newIstanbulInstructionSet() JumpTable {
 // byzantium and constantinople instructions.
 func newConstantinopleInstructionSet() JumpTable {
 	instructionSet := newByzantiumInstructionSet()
-	instructionSet[SHL] = &operation{
+	instructionSet[SHL] = operation{
 		execute:     opSHL,
 		constantGas: GasFastestStep,
 		numPop:      2,
 		numPush:     1,
 	}
-	instructionSet[SHR] = &operation{
+	instructionSet[SHR] = operation{
 		execute:     opSHR,
 		constantGas: GasFastestStep,
 		numPop:      2,
 		numPush:     1,
 	}
-	instructionSet[SAR] = &operation{
+	instructionSet[SAR] = operation{
 		execute:     opSAR,
 		constantGas: GasFastestStep,
 		numPop:      2,
 		numPush:     1,
 	}
-	instructionSet[EXTCODEHASH] = &operation{
+	instructionSet[EXTCODEHASH] = operation{
 		execute:     opExtCodeHash,
 		constantGas: params.ExtcodeHashGasConstantinople,
 		numPop:      1,
 		numPush:     1,
 	}
-	instructionSet[CREATE2] = &operation{
+	instructionSet[CREATE2] = operation{
 		execute:     opCreate2,
 		constantGas: params.Create2Gas,
 		dynamicGas:  gasCreate2,
@@ -218,7 +222,7 @@ func newConstantinopleInstructionSet() JumpTable {
 // byzantium instructions.
 func newByzantiumInstructionSet() JumpTable {
 	instructionSet := newSpuriousDragonInstructionSet()
-	instructionSet[STATICCALL] = &operation{
+	instructionSet[STATICCALL] = operation{
 		execute:     opStaticCall,
 		constantGas: params.CallGasEIP150,
 		dynamicGas:  gasStaticCall,
@@ -227,13 +231,13 @@ func newByzantiumInstructionSet() JumpTable {
 		memorySize:  memoryStaticCall,
 		string:      stStaticCall,
 	}
-	instructionSet[RETURNDATASIZE] = &operation{
+	instructionSet[RETURNDATASIZE] = operation{
 		execute:     opReturnDataSize,
 		constantGas: GasQuickStep,
 		numPop:      0,
 		numPush:     1,
 	}
-	instructionSet[RETURNDATACOPY] = &operation{
+	instructionSet[RETURNDATACOPY] = operation{
 		execute:     opReturnDataCopy,
 		constantGas: GasFastestStep,
 		dynamicGas:  gasReturnDataCopy,
@@ -242,7 +246,7 @@ func newByzantiumInstructionSet() JumpTable {
 		memorySize:  memoryReturnDataCopy,
 		string:      stReturnDataCopy,
 	}
-	instructionSet[REVERT] = &operation{
+	instructionSet[REVERT] = operation{
 		execute:    opRevert,
 		dynamicGas: gasRevert,
 		numPop:     2,
@@ -280,7 +284,7 @@ func newTangerineWhistleInstructionSet() JumpTable {
 // instructions that can be executed during the homestead phase.
 func newHomesteadInstructionSet() JumpTable {
 	instructionSet := newFrontierInstructionSet()
-	instructionSet[DELEGATECALL] = &operation{
+	instructionSet[DELEGATECALL] = operation{
 		execute:     opDelegateCall,
 		dynamicGas:  gasDelegateCall,
 		constantGas: params.CallGasFrontier,
@@ -1344,9 +1348,9 @@ func newFrontierInstructionSet() JumpTable {
 	}
 
 	// Fill all unassigned slots with opUndefined.
-	for i, entry := range tbl {
-		if entry == nil {
-			tbl[i] = &operation{execute: opUndefined}
+	for i := range tbl {
+		if tbl[i].execute == nil {
+			tbl[i] = operation{execute: opUndefined}
 		}
 	}
 
