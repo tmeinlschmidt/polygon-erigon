@@ -186,7 +186,7 @@ func (b *sortableBuffer) Sort() {
 	if sort.IsSorted(b) {
 		return
 	}
-	sort.Sort(b)
+	sort.Stable(b)
 }
 
 func (b *sortableBuffer) CheckFlushSize() bool {
@@ -245,7 +245,7 @@ func (b *appendSortableBuffer) Sort() {
 	for key, val := range b.entries {
 		b.sortedBuf = append(b.sortedBuf, sortableBufferEntry{key: []byte(key), value: val})
 	}
-	sort.Sort(b)
+	sort.Stable(b)
 }
 
 func (b *appendSortableBuffer) Less(i, j int) bool {
@@ -343,7 +343,7 @@ func (b *oldestEntrySortableBuffer) Sort() {
 	for k, v := range b.entries {
 		b.sortedBuf = append(b.sortedBuf, sortableBufferEntry{key: []byte(k), value: v})
 	}
-	sort.Sort(b)
+	sort.Stable(b)
 }
 
 func (b *oldestEntrySortableBuffer) Less(i, j int) bool {
