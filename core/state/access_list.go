@@ -23,8 +23,16 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 )
 
+// accessListKey is a composite key for flat slot lookups.
+// 52 bytes, no pointers — ideal as a map key.
+type accessListKey struct {
+	addr common.Address // 20 bytes
+	slot common.Hash    // 32 bytes
+}
+
 type accessList struct {
-	addresses map[common.Address]map[common.Hash]struct{}
+	addresses map[common.Address]int             // address -> slot count (0 means address present but no slots)
+	slots     map[accessListKey]struct{}          // flat (address, slot) lookup
 }
 
 // ContainsAddress returns true if the address is in the access list.
@@ -33,56 +41,34 @@ func (al *accessList) ContainsAddress(address common.Address) bool {
 	return ok
 }
 
-// Reset
-//func (al *accessList) Reset() {
-//	clear(al.addresses)
-//	clear(al.slots)
-//	al.slots = al.slots[:0]
-//}
-
 // Contains checks if a slot within an account is present in the access list, returning
 // separate flags for the presence of the account and the slot respectively.
 func (al *accessList) Contains(address common.Address, slot common.Hash) (addressPresent bool, slotPresent bool) {
-	slots, ok := al.addresses[address]
-	if !ok {
-		// no such address (and hence zero slots)
+	_, addrOk := al.addresses[address]
+	if !addrOk {
 		return false, false
 	}
-	if slots == nil {
-		// address yes, but no slots
-		return true, false
-	}
-	_, slotPresent = slots[slot]
-	return true, slotPresent
+	_, slotOk := al.slots[accessListKey{addr: address, slot: slot}]
+	return true, slotOk
 }
 
 // newAccessList creates a new accessList.
 func newAccessList() *accessList {
 	return &accessList{
-		addresses: map[common.Address]map[common.Hash]struct{}{},
+		addresses: make(map[common.Address]int),
+		slots:     make(map[accessListKey]struct{}),
 	}
 }
-
-//func (al *accessList) Reset() {
-//	clear(al.addresses)
-//	clear(al.slots)
-//}
 
 // Copy creates an independent copy of an accessList.
 func (al *accessList) Copy() *accessList {
 	cp := newAccessList()
 	for k, v := range al.addresses {
-		if v == nil {
-			cp.addresses[k] = v
-		} else {
-			slots := map[common.Hash]struct{}{}
-			for k := range v {
-				slots[k] = struct{}{}
-			}
-			cp.addresses[k] = slots
-		}
+		cp.addresses[k] = v
 	}
-
+	for k := range al.slots {
+		cp.slots[k] = struct{}{}
+	}
 	return cp
 }
 
@@ -92,7 +78,7 @@ func (al *accessList) AddAddress(address common.Address) bool {
 	if _, present := al.addresses[address]; present {
 		return false
 	}
-	al.addresses[address] = nil
+	al.addresses[address] = 0
 	return true
 }
 
@@ -102,19 +88,20 @@ func (al *accessList) AddAddress(address common.Address) bool {
 // - slot added
 // For any 'true' value returned, a corresponding journal entry must be made.
 func (al *accessList) AddSlot(address common.Address, slot common.Hash) (addrChange bool, slotChange bool) {
-	slots, addrPresent := al.addresses[address]
-	if !addrPresent || slots == nil {
-		// Address not present, or addr present but no slots there
-		al.addresses[address] = map[common.Hash]struct{}{slot: {}}
-		return !addrPresent, true
+	_, addrPresent := al.addresses[address]
+	key := accessListKey{addr: address, slot: slot}
+	if _, slotPresent := al.slots[key]; slotPresent {
+		// Both address and slot already present
+		return false, false
 	}
-	if _, ok := slots[slot]; !ok {
-		slots[slot] = struct{}{}
-		// Journal add slot change
-		return false, true
+	// Slot not present, add it
+	al.slots[key] = struct{}{}
+	if !addrPresent {
+		al.addresses[address] = 1
+		return true, true
 	}
-	// No changes required
-	return false, false
+	al.addresses[address]++
+	return false, true
 }
 
 // DeleteSlot removes an (address, slot)-tuple from the access list.
@@ -122,17 +109,15 @@ func (al *accessList) AddSlot(address common.Address, slot common.Hash) (addrCha
 // This method is meant to be used  by the journal, which maintains ordering of
 // operations.
 func (al *accessList) DeleteSlot(address common.Address, slot common.Hash) {
-	slots, addrOk := al.addresses[address]
-	// There are two ways this can fail
+	slotCount, addrOk := al.addresses[address]
 	if !addrOk {
 		panic("reverting slot change, address not present in list")
 	}
-	delete(slots, slot)
-	// If that was the last (first) slot, remove it
-	// Since additions and rollbacks are always performed in order,
-	// we can delete the item without worrying about screwing up later indices
-	if len(slot) == 0 {
-		al.addresses[address] = nil
+	key := accessListKey{addr: address, slot: slot}
+	delete(al.slots, key)
+	// Decrement slot count
+	if slotCount > 0 {
+		al.addresses[address] = slotCount - 1
 	}
 }
 
@@ -141,12 +126,27 @@ func (al *accessList) DeleteSlot(address common.Address, slot common.Hash) {
 // This method is meant to be used  by the journal, which maintains ordering of
 // operations.
 func (al *accessList) DeleteAddress(address common.Address) {
-	slots, addrOk := al.addresses[address]
+	slotCount, addrOk := al.addresses[address]
 	if !addrOk {
 		panic("reverting address change, address not present in list")
 	}
-	if len(slots) > 0 {
+	if slotCount > 0 {
 		panic("reverting address change, address has slots")
 	}
 	delete(al.addresses, address)
+}
+
+// SlotsForAddress returns all slot hashes associated with the given address.
+// Used only for testing purposes.
+func (al *accessList) SlotsForAddress(address common.Address) map[common.Hash]struct{} {
+	if _, ok := al.addresses[address]; !ok {
+		return nil
+	}
+	result := make(map[common.Hash]struct{})
+	for key := range al.slots {
+		if key.addr == address {
+			result[key.slot] = struct{}{}
+		}
+	}
+	return result
 }
