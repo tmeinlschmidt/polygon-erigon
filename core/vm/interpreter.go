@@ -307,6 +307,17 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		in.DecDepth()
 	}()
 
+
+	// Fast path: skip all tracer checks when no tracing is active
+	if !debug && !trace && !dbg.TraceDyanmicGas {
+		res, err = in.runUntraced(contract, callContext, locStack, mem, pc)
+		if err == errStopToken {
+			err = nil
+		}
+		ret = res
+		return
+	}
+
 	// The Interpreter main run loop (contextual). This loop runs until either an
 	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
 	// the execution of one of the operations or until the done flag is set by the
@@ -434,3 +445,62 @@ func (in *EVMInterpreter) IncDepth() { in.depth++ }
 
 // Decrements the current call stack's depth
 func (in *EVMInterpreter) DecDepth() { in.depth-- }
+
+// runUntraced is the optimized interpreter loop for production use when no
+// tracer is attached. It eliminates per-opcode tracer nil checks and trace
+// flag branches, reducing branch misprediction on the hottest loop.
+func (in *EVMInterpreter) runUntraced(contract *Contract, callContext *ScopeContext, locStack *Stack, mem *Memory, pc *uint64) ([]byte, error) {
+	steps := 0
+	for {
+		steps++
+		if steps%5000 == 0 && in.evm.Cancelled() {
+			break
+		}
+
+		op := contract.GetOp(*pc)
+		operation := in.jt[op]
+		cost := operation.constantGas
+
+		if sLen := locStack.len(); sLen < operation.numPop {
+			return nil, &ErrStackUnderflow{stackLen: sLen, required: operation.numPop}
+		} else if sLen > operation.maxStack {
+			return nil, &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
+		}
+		if !contract.UseGas(cost, nil, tracing.GasChangeIgnored) {
+			return nil, ErrOutOfGas
+		}
+
+		var memorySize uint64
+		if operation.dynamicGas != nil {
+			if operation.memorySize != nil {
+				memSize, overflow := operation.memorySize(locStack)
+				if overflow {
+					return nil, ErrGasUintOverflow
+				}
+				if memorySize, overflow = math.SafeMul(ToWordSize(memSize), 32); overflow {
+					return nil, ErrGasUintOverflow
+				}
+			}
+			var dynamicCost uint64
+			var err error
+			dynamicCost, err = operation.dynamicGas(in.evm, contract, locStack, mem, memorySize)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrOutOfGas, err)
+			}
+			if !contract.UseGas(dynamicCost, nil, tracing.GasChangeIgnored) {
+				return nil, ErrOutOfGas
+			}
+		}
+
+		if memorySize > 0 {
+			mem.Resize(memorySize)
+		}
+
+		res, err := operation.execute(pc, in, callContext)
+		if err != nil {
+			return res, err
+		}
+		*pc++
+	}
+	return nil, errStopToken
+}
