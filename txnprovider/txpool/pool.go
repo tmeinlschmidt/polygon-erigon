@@ -101,7 +101,7 @@ type TxPool struct {
 	_chainDB               kv.TemporalRoDB // remote db - use it wisely
 	_stateCache            kvcache.Cache
 	poolDB                 kv.RwDB
-	lock                   *sync.Mutex
+	lock                   sync.RWMutex
 	recentlyConnectedPeers *recentlyConnectedPeers // all txns will be propagated to this peers eventually, and clear list
 	senders                *sendersBatch
 	// batch processing of remote transactions
@@ -214,11 +214,7 @@ func New(
 		return nil, errors.New("chainID overflow")
 	}
 
-	lock := &sync.Mutex{}
-
 	res := &TxPool{
-		lock:                    lock,
-		lastSeenCond:            sync.NewCond(lock),
 		byHash:                  map[string]*metaTxn{},
 		isLocalLRU:              localsHistory,
 		discardReasonsLRU:       discardHistory,
@@ -250,6 +246,7 @@ func New(
 			txnHash common.Hash
 		}),
 	}
+	res.lastSeenCond = sync.NewCond(&res.lock)
 
 	if chainConfig.ShanghaiTime != nil {
 		if !chainConfig.ShanghaiTime.IsUint64() {
@@ -663,15 +660,15 @@ func (p *TxPool) getRlpLocked(tx kv.Tx, hash []byte) (rlpTxn []byte, sender comm
 }
 
 func (p *TxPool) GetRlp(tx kv.Tx, hash []byte) ([]byte, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	rlpTx, _, _, err := p.getRlpLocked(tx, hash)
 	return common.Copy(rlpTx), err
 }
 
 func (p *TxPool) AppendLocalAnnouncements(types []byte, sizes []uint32, hashes []byte) ([]byte, []uint32, []byte) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	for hash, txn := range p.byHash {
 		if txn.subPool&IsLocal == 0 {
 			continue
@@ -684,8 +681,8 @@ func (p *TxPool) AppendLocalAnnouncements(types []byte, sizes []uint32, hashes [
 }
 
 func (p *TxPool) AppendRemoteAnnouncements(types []byte, sizes []uint32, hashes []byte) ([]byte, []uint32, []byte) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	for hash, txn := range p.byHash {
 		if txn.subPool&IsLocal != 0 {
@@ -784,8 +781,8 @@ func (p *TxPool) getCachedBlobTxnLocked(tx kv.Tx, hash []byte) (*metaTxn, error)
 
 func (p *TxPool) IsLocal(idHash []byte) bool {
 	hashS := string(idHash)
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p.isLocalLRU.Contains(hashS)
 }
 
@@ -976,8 +973,8 @@ func (p *TxPool) PeekBest(ctx context.Context, n int, txns *TxnsRlp, onTopOf, av
 }
 
 func (p *TxPool) CountContent() (int, int, int) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p.pending.Len(), p.baseFee.Len(), p.queued.Len()
 }
 
@@ -1512,8 +1509,8 @@ func (p *TxPool) AddLocalTxns(ctx context.Context, newTxns TxnSlots) ([]txpoolcf
 }
 
 func (p *TxPool) chainDB() (kv.TemporalRoDB, kvcache.Cache) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p._chainDB, p._stateCache
 }
 
@@ -1821,8 +1818,8 @@ func (p *TxPool) discardLocked(mt *metaTxn, reason txpoolcfg.DiscardReason) {
 }
 
 func (p *TxPool) getBlobsAndProofByBlobHashLocked(blobHashes []common.Hash) []PoolBlobBundle {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	blobBundles := make([]PoolBlobBundle, len(blobHashes))
 	for i, h := range blobHashes {
 		th, ok := p.blobHashToTxn[h]
@@ -1886,8 +1883,8 @@ func (p *TxPool) deleteMinedBlobTxn(hash string) {
 }
 
 func (p *TxPool) NonceFromAddress(addr [20]byte) (nonce uint64, inPool bool) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	senderID, found := p.senders.getID(addr)
 	if !found {
 		return 0, false
@@ -2701,8 +2698,8 @@ func (p *TxPool) logStats() {
 		return
 	}
 
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	ctx := []interface{}{
 		"pending", p.pending.Len(),
@@ -2726,7 +2723,7 @@ func (p *TxPool) deprecatedForEach(_ context.Context, f func(rlp []byte, sender 
 	var subPoolTypes []SubPoolType
 	var rlpValues [][]byte
 
-	p.lock.Lock()
+	p.lock.RLock()
 
 	p.all.ascendAll(func(mt *metaTxn) bool {
 		if sender, found := p.senders.senderID2Addr[mt.TxnSlot.SenderID]; found {
@@ -2739,7 +2736,7 @@ func (p *TxPool) deprecatedForEach(_ context.Context, f func(rlp []byte, sender 
 		return true
 	})
 
-	p.lock.Unlock()
+	p.lock.RUnlock()
 
 	for i := range txns {
 		slotRlp := rlpValues[i]
