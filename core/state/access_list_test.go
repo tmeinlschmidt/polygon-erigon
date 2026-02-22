@@ -69,7 +69,7 @@ func verifySlots(t *testing.T, s *IntraBlockState, addrString string, slotString
 		}
 	}
 	// Check that no extra elements are in the access list
-	stateSlots := s.accessList.addresses[address]
+	stateSlots := s.accessList.SlotsForAddress(address)
 	for s := range stateSlots {
 		if _, slotPresent := slotMap[s]; !slotPresent {
 			t.Fatalf("scope has extra slot %v (address %v)", s, addrString)
