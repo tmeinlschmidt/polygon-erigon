@@ -114,14 +114,14 @@ type IntraBlockState struct {
 func New(stateReader StateReader) *IntraBlockState {
 	return &IntraBlockState{
 		stateReader:       stateReader,
-		stateObjects:      map[common.Address]*stateObject{},
-		stateObjectsDirty: map[common.Address]struct{}{},
-		nilAccounts:       map[common.Address]struct{}{},
+		stateObjects:      make(map[common.Address]*stateObject, 256),
+		stateObjectsDirty: make(map[common.Address]struct{}, 256),
+		nilAccounts:       make(map[common.Address]struct{}, 256),
 		logs:              []types.Logs{},
 		journal:           newJournal(),
 		accessList:        newAccessList(),
 		transientStorage:  newTransientStorage(),
-		balanceInc:        map[common.Address]*BalanceIncrease{},
+		balanceInc:        make(map[common.Address]*BalanceIncrease, 4),
 		txIndex:           0,
 		trace:             false,
 		dep:               -1,
@@ -244,14 +244,14 @@ func (sdb *IntraBlockState) HasStorage(addr common.Address) (bool, error) {
 // Reset clears out all ephemeral state objects from the state db, but keeps
 // the underlying state trie to avoid reloading data for the next operations.
 func (sdb *IntraBlockState) Reset() {
-	sdb.nilAccounts = map[common.Address]struct{}{}
-	sdb.stateObjects = map[common.Address]*stateObject{}
-	sdb.stateObjectsDirty = map[common.Address]struct{}{}
+	clear(sdb.nilAccounts)
+	clear(sdb.stateObjects)
+	clear(sdb.stateObjectsDirty)
 	for i := range sdb.logs {
-		clear(sdb.logs[i]) // free p¬ointers
+		clear(sdb.logs[i]) // free pointers
 		sdb.logs[i] = sdb.logs[i][:0]
 	}
-	sdb.balanceInc = map[common.Address]*BalanceIncrease{}
+	clear(sdb.balanceInc)
 	sdb.journal.Reset()
 	sdb.nextRevisionId = 0
 	sdb.validRevisions = sdb.validRevisions[:0]
