@@ -20,6 +20,8 @@
 package state
 
 import (
+	"sync"
+
 	"github.com/erigontech/erigon-lib/common"
 )
 
@@ -28,6 +30,14 @@ import (
 type accessListKey struct {
 	addr common.Address // 20 bytes
 	slot common.Hash    // 32 bytes
+}
+
+// accessListPool reuses accessList objects to reduce per-transaction allocation overhead.
+// Each accessList is Reset before being returned to the pool.
+var accessListPool = sync.Pool{
+	New: func() any {
+		return newAccessList()
+	},
 }
 
 type accessList struct {
@@ -39,6 +49,26 @@ type accessList struct {
 func (al *accessList) ContainsAddress(address common.Address) bool {
 	_, ok := al.addresses[address]
 	return ok
+}
+
+// Reset clears the accessList for reuse, preserving map bucket arrays.
+func (al *accessList) Reset() {
+	clear(al.addresses)
+	clear(al.slots)
+}
+
+// getAccessList retrieves an accessList from the pool, ready for use.
+func getAccessList() *accessList {
+	return accessListPool.Get().(*accessList)
+}
+
+// putAccessList resets and returns an accessList to the pool.
+func putAccessList(al *accessList) {
+	if al == nil {
+		return
+	}
+	al.Reset()
+	accessListPool.Put(al)
 }
 
 // Contains checks if a slot within an account is present in the access list, returning
