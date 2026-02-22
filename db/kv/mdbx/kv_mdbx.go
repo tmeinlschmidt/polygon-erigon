@@ -56,6 +56,32 @@ func init() {
 	mdbx.MapFullErrorMessage += " You can try remove the database files (e.g., by running rm -rf /path/to/db)"
 }
 
+// batchSizeForLabel returns the max batch size for MDBX, configurable via
+// MDBX_BATCH_SIZE_<LABEL> or MDBX_BATCH_SIZE env vars.
+func batchSizeForLabel(label string) int {
+	envKey := "MDBX_BATCH_SIZE_" + strings.ToUpper(label)
+	if v, _ := os.LookupEnv(envKey); v != "" {
+		return int(dbg.MustParseInt(v))
+	}
+	if v, _ := os.LookupEnv("MDBX_BATCH_SIZE"); v != "" {
+		return int(dbg.MustParseInt(v))
+	}
+	return DefaultMaxBatchSize
+}
+
+// batchDelayForLabel returns the max batch delay for MDBX, configurable via
+// MDBX_BATCH_DELAY_MS_<LABEL> or MDBX_BATCH_DELAY_MS env vars.
+func batchDelayForLabel(label string) time.Duration {
+	envKey := "MDBX_BATCH_DELAY_MS_" + strings.ToUpper(label)
+	if v, _ := os.LookupEnv(envKey); v != "" {
+		return time.Duration(dbg.MustParseInt(v)) * time.Millisecond
+	}
+	if v, _ := os.LookupEnv("MDBX_BATCH_DELAY_MS"); v != "" {
+		return time.Duration(dbg.MustParseInt(v)) * time.Millisecond
+	}
+	return DefaultMaxBatchDelay
+}
+
 const NonExistingDBI kv.DBI = 999_999_999
 
 type TableCfgFunc func(defaultBuckets kv.TableCfg) kv.TableCfg
@@ -383,8 +409,8 @@ func (opts MdbxOpts) Open(ctx context.Context) (kv.RwDB, error) {
 
 		leakDetector: dbg.NewLeakDetector("db."+string(opts.label), dbg.SlowTx()),
 
-		MaxBatchSize:  DefaultMaxBatchSize,
-		MaxBatchDelay: DefaultMaxBatchDelay,
+		MaxBatchSize:  batchSizeForLabel(string(opts.label)),
+		MaxBatchDelay: batchDelayForLabel(string(opts.label)),
 	}
 
 	customBuckets := opts.bucketsCfg(kv.TablesCfgByLabel(opts.label))
