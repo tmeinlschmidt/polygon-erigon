@@ -26,7 +26,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	btree2 "github.com/tidwall/btree"
@@ -95,7 +94,7 @@ type Domain struct {
 type domainVisible struct {
 	files  []visibleFile
 	name   kv.Domain
-	caches *sync.Pool
+	cache *DomainGetFromFileCache
 }
 
 func NewDomain(cfg statecfg.DomainCfg, stepSize uint64, dirs datadir.Dirs, logger log.Logger) (*Domain, error) {

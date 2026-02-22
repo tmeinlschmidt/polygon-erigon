@@ -2,7 +2,7 @@ package state
 
 import (
 	"fmt"
-	"sync"
+	"sync/atomic"
 
 	"github.com/elastic/go-freelru"
 
@@ -19,7 +19,7 @@ type u128 struct{ hi, lo uint64 }      //nolint
 type u192 struct{ hi, lo, ext uint64 } //nolint
 
 type DomainGetFromFileCache struct {
-	*freelru.LRU[uint64, domainGetFromFileCacheItem]
+	*freelru.SyncedLRU[uint64, domainGetFromFileCacheItem]
 	enabled, trace bool
 	limit          uint32
 }
@@ -37,11 +37,11 @@ var (
 )
 
 func NewDomainGetFromFileCache(limit uint32) *DomainGetFromFileCache {
-	c, err := freelru.New[uint64, domainGetFromFileCacheItem](limit, u64noHash)
+	c, err := freelru.NewSynced[uint64, domainGetFromFileCacheItem](limit, u64noHash)
 	if err != nil {
 		panic(err)
 	}
-	return &DomainGetFromFileCache{LRU: c, enabled: domainGetFromFileCacheEnabled, trace: domainGetFromFileCacheTrace, limit: limit}
+	return &DomainGetFromFileCache{SyncedLRU: c, enabled: domainGetFromFileCacheEnabled, trace: domainGetFromFileCacheTrace, limit: limit}
 }
 
 func (c *DomainGetFromFileCache) SetTrace(v bool) { c.trace = v }
@@ -68,7 +68,7 @@ func newDomainVisible(name kv.Domain, files []visibleFile) *domainVisible {
 	if limit == 0 {
 		domainGetFromFileCacheEnabled = false
 	}
-	d.caches = &sync.Pool{New: func() any { return NewDomainGetFromFileCache(limit) }}
+	d.cache = NewDomainGetFromFileCache(limit)
 	return d
 }
 
@@ -76,14 +76,13 @@ func (v *domainVisible) newGetFromFileCache() *DomainGetFromFileCache {
 	if !domainGetFromFileCacheEnabled {
 		return nil
 	}
-	return v.caches.Get().(*DomainGetFromFileCache)
+	return v.cache
 }
 func (v *domainVisible) returnGetFromFileCache(c *DomainGetFromFileCache) {
 	if c == nil {
 		return
 	}
 	c.LogStats(v.name)
-	v.caches.Put(c)
 }
 
 var (
@@ -93,9 +92,9 @@ var (
 )
 
 type IISeekInFilesCache struct {
-	*freelru.LRU[uint64, iiSeekInFilesCacheItem] // murmur3(key) -> {requestedTxNum, foundTxNum}
+	*freelru.SyncedLRU[uint64, iiSeekInFilesCacheItem] // murmur3(key) -> {requestedTxNum, foundTxNum}
 
-	hit, total int
+	hit, total atomic.Int64
 	trace      bool
 }
 type iiSeekInFilesCacheItem struct {
@@ -106,11 +105,11 @@ func NewIISeekInFilesCache() *IISeekInFilesCache {
 	if !iiGetFromFileCacheEnabled {
 		return nil
 	}
-	c, err := freelru.New[uint64, iiSeekInFilesCacheItem](iiGetFromFileCacheLimit, u64noHash)
+	c, err := freelru.NewSynced[uint64, iiSeekInFilesCacheItem](iiGetFromFileCacheLimit, u64noHash)
 	if err != nil {
 		panic(err)
 	}
-	return &IISeekInFilesCache{LRU: c, trace: iiGetFromFileCacheTrace}
+	return &IISeekInFilesCache{SyncedLRU: c, trace: iiGetFromFileCacheTrace}
 }
 func (c *IISeekInFilesCache) SetTrace(v bool) { c.trace = v }
 func (c *IISeekInFilesCache) LogStats(fileBaseName string) {
@@ -118,7 +117,7 @@ func (c *IISeekInFilesCache) LogStats(fileBaseName string) {
 		return
 	}
 	m := c.Metrics()
-	log.Warn("[dbg] II_LRU", "a", fileBaseName, "ratio", fmt.Sprintf("%.2f", float64(c.hit)/float64(c.total)), "hit", c.hit, "collisions", m.Collisions, "evictions", m.Evictions, "inserts", m.Inserts, "removals", m.Removals, "limit", iiGetFromFileCacheLimit)
+	log.Warn("[dbg] II_LRU", "a", fileBaseName, "ratio", fmt.Sprintf("%.2f", float64(c.hit.Load())/float64(c.total.Load())), "hit", c.hit.Load(), "collisions", m.Collisions, "evictions", m.Evictions, "inserts", m.Inserts, "removals", m.Removals, "limit", iiGetFromFileCacheLimit)
 }
 
 func newIIVisible(name string, files []visibleFile) *iiVisible {
@@ -126,19 +125,18 @@ func newIIVisible(name string, files []visibleFile) *iiVisible {
 		iiGetFromFileCacheEnabled = false
 	}
 	ii := &iiVisible{
-		name:   name,
-		files:  files,
-		caches: &sync.Pool{New: func() any { return NewIISeekInFilesCache() }},
+		name:  name,
+		files: files,
+		cache: NewIISeekInFilesCache(),
 	}
 	return ii
 }
 func (v *iiVisible) newSeekInFilesCache() *IISeekInFilesCache {
-	return v.caches.Get().(*IISeekInFilesCache)
+	return v.cache
 }
 func (v *iiVisible) returnSeekInFilesCache(c *IISeekInFilesCache) {
 	if c == nil {
 		return
 	}
 	c.LogStats(v.name)
-	v.caches.Put(c)
 }
