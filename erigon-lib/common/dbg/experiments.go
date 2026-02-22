@@ -62,7 +62,7 @@ var (
 	// Values from 1 to 4 makes sense since we have only 3 types of snapshots.
 	BuildSnapshotAllowance = EnvInt("SNAPSHOT_BUILD_SEMA_SIZE", 1) // allows 1 kind of snapshots to be built simultaneously
 
-	SnapshotMadvRnd = EnvBool("SNAPSHOT_MADV_RND", true)
+	SnapshotMadvRnd = EnvBool("SNAPSHOT_MADV_RND", false)
 	OnlyCreateDB    = EnvBool("ONLY_CREATE_DB", false)
 
 	CommitEachStage = EnvBool("COMMIT_EACH_STAGE", false)
