@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -88,7 +87,7 @@ type InvertedIndex struct {
 type iiVisible struct {
 	files  []visibleFile
 	name   string
-	caches *sync.Pool
+	cache *IISeekInFilesCache
 }
 
 func NewInvertedIndex(cfg statecfg.InvIdxCfg, stepSize uint64, dirs datadir.Dirs, logger log.Logger) (*InvertedIndex, error) {
@@ -562,14 +561,14 @@ func (iit *InvertedIndexRoTx) seekInFiles(key []byte, txNum uint64) (found bool,
 	}
 
 	if iit.seekInFilesCache != nil {
-		iit.seekInFilesCache.total++
+		iit.seekInFilesCache.total.Add(1)
 		fromCache, ok := iit.seekInFilesCache.Get(hi)
 		if ok && fromCache.requested <= txNum {
 			if txNum <= fromCache.found {
-				iit.seekInFilesCache.hit++
+				iit.seekInFilesCache.hit.Add(1)
 				return true, fromCache.found, nil
 			} else if fromCache.found == 0 { //not found
-				iit.seekInFilesCache.hit++
+				iit.seekInFilesCache.hit.Add(1)
 				return false, 0, nil
 			}
 		}
