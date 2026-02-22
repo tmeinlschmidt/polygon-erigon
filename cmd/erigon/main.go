@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime/debug"
 
 	"github.com/anacrolix/envpprof"
 	"github.com/felixge/fgprof"
@@ -33,11 +34,20 @@ import (
 	"github.com/erigontech/erigon/diagnostics"
 	erigonapp "github.com/erigontech/erigon/turbo/app"
 	erigoncli "github.com/erigontech/erigon/turbo/cli"
-	"github.com/erigontech/erigon/turbo/debug"
+	turbodebug "github.com/erigontech/erigon/turbo/debug"
 	"github.com/erigontech/erigon/turbo/node"
 )
 
+// configureGC sets GC tuning parameters early in startup to reduce GC overhead on large heaps.
+// GOGC=50 triggers GC more frequently at smaller heap growth, reducing peak memory and pause times.
+// GOMEMLIMIT is left to the operator via the GOMEMLIMIT environment variable.
+func configureGC() {
+	prev := debug.SetGCPercent(50)
+	fmt.Fprintf(os.Stderr, "[gc-tuning] GOGC set to 50 (was %d). Set GOMEMLIMIT env var to control memory limit.\n", prev)
+}
+
 func main() {
+	configureGC()
 	defer envpprof.Stop()
 	http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
 	app := erigonapp.MakeApp("erigon", runErigon, erigoncli.DefaultFlags)
@@ -52,7 +62,7 @@ func main() {
 }
 
 func runErigon(cliCtx *cli.Context) (err error) {
-	logger, tracer, metricsMux, pprofMux, err := debug.Setup(cliCtx, true /* rootLogger */)
+	logger, tracer, metricsMux, pprofMux, err := turbodebug.Setup(cliCtx, true /* rootLogger */)
 	if err != nil {
 		return
 	}
