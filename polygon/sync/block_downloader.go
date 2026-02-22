@@ -39,10 +39,10 @@ import (
 )
 
 const (
-	notEnoughPeersBackOffDuration = time.Minute
+	notEnoughPeersBackOffDuration = 15 * time.Second
 
-	// conservative over-estimation: 1 MB block size x 1024 blocks per waypoint
-	blockDownloaderEstimatedRamPerWorker = estimate.EstimatedRamPerWorker(1 * datasize.GB)
+	// Polygon blocks are 100KB-1MB; 128MB is sufficient per worker
+	blockDownloaderEstimatedRamPerWorker = estimate.EstimatedRamPerWorker(128 * datasize.MB)
 )
 
 func NewBlockDownloader(
