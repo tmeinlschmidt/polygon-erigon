@@ -555,6 +555,7 @@ type Getter struct {
 	dataBit     int // Value 0..7 - position of the bit
 	trace       bool
 	d           *Decompressor
+	buf         []byte // reusable buffer for MatchCmp
 }
 
 func (g *Getter) MadvNormal() MadvDisabler {
@@ -938,7 +939,13 @@ func (g *Getter) MatchCmp(buf []byte) int {
 		return 0
 	}
 
-	decoded := make([]byte, wordLen)
+	if uint64(cap(g.buf)) < wordLen {
+		g.buf = make([]byte, wordLen)
+	} else {
+		g.buf = g.buf[:wordLen]
+		clear(g.buf)
+	}
+	decoded := g.buf
 	var bufPos int
 	// In the first pass, we only check patterns
 	for pos := g.nextPos(false /* clean */); pos != 0; pos = g.nextPos(false) {
