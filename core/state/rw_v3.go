@@ -273,7 +273,7 @@ func (rs *ParallelExecutionState) SizeEstimate() (r uint64) {
 }
 
 func (rs *ParallelExecutionState) ReadsValid(readLists map[string]*dbstate.KvList) bool {
-	return false
+	return rs.domains.ReadsValid(readLists)
 }
 
 // StateWriterBufferedV3 - used by parallel workers to accumulate updates and then send them to conflict-resolution.
