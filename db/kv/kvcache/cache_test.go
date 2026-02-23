@@ -43,34 +43,35 @@ func TestEvictionInUnexpectedOrder(t *testing.T) {
 	// Order: View - 2, OnNewBlock - 2, View - 5, View - 6, OnNewBlock - 3, OnNewBlock - 4, View - 5, OnNewBlock - 5, OnNewBlock - 100
 	require := require.New(t)
 	cfg := DefaultCoherentConfig
-	cfg.CacheSize = 3
+	cfg.CacheSize = 3 * DefaultNumShards // per-shard budget = 3
 	cfg.NewBlockWait = 0
+	cfg.NumShards = 1 // use 1 shard for this test to keep eviction logic simple
 	c := New(cfg)
 	c.selectOrCreateRoot(2)
 	require.Len(c.roots, 1)
 	require.Zero(int(c.latestStateVersionID))
 	require.False(c.roots[2].isCanonical)
 
-	c.add([]byte{1}, nil, c.roots[2], 2)
-	require.Zero(c.stateEvict.Len())
+	c.add([]byte{1}, nil, c.roots[2], 2, c.latestStateVersionID)
+	require.Zero(c.totalStateEvictLen())
 
 	c.advanceRoot(2)
 	require.Len(c.roots, 1)
 	require.Equal(2, int(c.latestStateVersionID))
 	require.True(c.roots[2].isCanonical)
 
-	c.add([]byte{1}, nil, c.roots[2], 2)
-	require.Equal(1, c.stateEvict.Len())
+	c.add([]byte{1}, nil, c.roots[2], 2, c.latestStateVersionID)
+	require.Equal(1, c.totalStateEvictLen())
 
 	c.selectOrCreateRoot(5)
 	require.Len(c.roots, 2)
 	require.Equal(2, int(c.latestStateVersionID))
 	require.False(c.roots[5].isCanonical)
 
-	c.add([]byte{2}, nil, c.roots[5], 5) // not added to evict list
-	require.Equal(1, c.stateEvict.Len())
-	c.add([]byte{2}, nil, c.roots[2], 2) // added to evict list, because it's latest view
-	require.Equal(2, c.stateEvict.Len())
+	c.add([]byte{2}, nil, c.roots[5], 5, c.latestStateVersionID) // not added to evict list
+	require.Equal(1, c.totalStateEvictLen())
+	c.add([]byte{2}, nil, c.roots[2], 2, c.latestStateVersionID) // added to evict list, because it's latest view
+	require.Equal(2, c.totalStateEvictLen())
 
 	c.selectOrCreateRoot(6)
 	require.Len(c.roots, 3)
@@ -102,9 +103,8 @@ func TestEvictionInUnexpectedOrder(t *testing.T) {
 	require.Equal(100, int(c.latestStateVersionID))
 	require.True(c.roots[100].isCanonical)
 
-	//c.add([]byte{1}, nil, c.roots[2], 2)
-	require.Equal(0, c.latestStateView.cache.Len())
-	require.Equal(0, c.stateEvict.Len())
+	require.Equal(0, c.latestStateViewLen())
+	require.Equal(0, c.totalStateEvictLen())
 }
 
 func TestEviction(t *testing.T) {
@@ -112,6 +112,7 @@ func TestEviction(t *testing.T) {
 	cfg := DefaultCoherentConfig
 	cfg.CacheSize = 21
 	cfg.NewBlockWait = 0
+	cfg.NumShards = 1 // use 1 shard so per-shard budget = CacheSize
 	c := New(cfg)
 
 	dirs := datadir.New(t.TempDir())
@@ -131,11 +132,9 @@ func TestEviction(t *testing.T) {
 		_, _ = c.Get([]byte{1}, tx, view.stateVersionID)
 		_, _ = c.Get([]byte{2}, tx, view.stateVersionID)
 		_, _ = c.Get([]byte{3}, tx, view.stateVersionID)
-		//require.Equal(c.roots[c.latestViewID].cache.Len(), c.stateEvict.Len())
 		return nil
 	})
-	require.Equal(0, c.stateEvict.Len())
-	//require.Equal(c.roots[c.latestViewID].cache.Len(), c.stateEvict.Len())
+	require.Equal(0, c.totalStateEvictLen())
 	c.OnNewBlock(&remoteproto.StateChangeBatch{
 		StateVersionId: id + 1,
 		ChangeBatch: []*remoteproto.StateChange{
@@ -149,9 +148,8 @@ func TestEviction(t *testing.T) {
 			},
 		},
 	})
-	require.Equal(21, c.stateEvict.Size())
-	require.Equal(1, c.stateEvict.Len())
-	require.Equal(c.roots[c.latestStateVersionID].cache.Len(), c.stateEvict.Len())
+	require.Equal(21, c.totalStateEvictSize())
+	require.Equal(1, c.totalStateEvictLen())
 	_ = db.UpdateTemporal(ctx, func(tx kv.TemporalRwTx) error {
 		_ = tx.Put(kv.PlainState, k1[:], []byte{1})
 		id = tx.ViewID()
@@ -166,8 +164,7 @@ func TestEviction(t *testing.T) {
 		_, _ = c.Get([]byte{6}, tx, view.stateVersionID)
 		return nil
 	})
-	require.Equal(c.roots[c.latestStateVersionID].cache.Len(), c.stateEvict.Len())
-	require.Equal(int(cfg.CacheSize.Bytes()), c.stateEvict.Size())
+	require.Equal(int(cfg.CacheSize.Bytes()), c.totalStateEvictSize())
 }
 
 func TestAPI(t *testing.T) {
@@ -443,13 +440,6 @@ func TestAPI(t *testing.T) {
 		}
 		fmt.Printf("done4: \n")
 	}()
-	// TODO: Used in other places too cant modify this.
-	// err := db.View(context.Background(), func(tx kv.Tx) error {
-	// 	_, err := AssertCheckValues(context.Background(), tx, c)
-	// 	require.NoError(err)
-	// 	return nil
-	// })
-	// require.NoError(err)
 
 	// Wait for all goroutines to complete or timeout
 	done := make(chan struct{})
@@ -487,7 +477,6 @@ func TestCode(t *testing.T) {
 		require.NoError(err)
 		require.Equal(k2[:], v)
 
-		//require.Equal(c.roots[c.latestViewID].cache.Len(), c.stateEvict.Len())
 		return nil
 	})
 }

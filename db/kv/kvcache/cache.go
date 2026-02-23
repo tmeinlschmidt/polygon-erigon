@@ -61,35 +61,62 @@ type CacheView interface {
 	HasStorage(address common.Address) (bool, error)
 }
 
+const (
+	DEGREE           = 32
+	MAX_WAITS        = 100
+	DefaultNumShards = 16
+)
+
+type CoherentConfig struct {
+	CacheSize       datasize.ByteSize
+	CodeCacheSize   datasize.ByteSize
+	WaitForNewBlock bool // should we wait 10ms for a new block message to arrive when calling View?
+	WithStorage     bool
+	MetricsLabel    string
+	NewBlockWait    time.Duration // how long wait
+	KeepViews       uint64        // keep in memory up to this amount of views, evict older
+	NumShards       uint32        // must be power of 2; 0 means DefaultNumShards
+}
+
+var DefaultCoherentConfig = CoherentConfig{
+	KeepViews:       5,
+	NewBlockWait:    5 * time.Millisecond,
+	CacheSize:       2 * datasize.GB,
+	CodeCacheSize:   2 * datasize.GB,
+	MetricsLabel:    "default",
+	WithStorage:     true,
+	WaitForNewBlock: true,
+}
+
+// cacheShard holds one partition of BTrees and eviction lists.
+// A single mutex protects both BTree lookup and eviction MoveToFront,
+// eliminating the double-lock pattern from the old design.
+type cacheShard struct {
+	mu         sync.Mutex
+	cache      *btree2.BTreeG[*Element]
+	codeCache  *btree2.BTreeG[*Element]
+	stateEvict *List
+	codeEvict  *List
+}
+
+func newCacheShard() cacheShard {
+	return cacheShard{
+		cache:      btree2.NewBTreeG[*Element](Less),
+		codeCache:  btree2.NewBTreeG[*Element](Less),
+		stateEvict: NewList(),
+		codeEvict:  NewList(),
+	}
+}
+
 // Coherent works on top of Database Transaction and pair Coherent+ReadTransaction must
 // provide "Serializable Isolation Level" semantic: all data form consistent db view at moment
 // when read transaction started, read data are immutable until end of read transaction, reader can't see newer updates
 //
-// Every time a new state change comes, we do the following:
-// - Check that prevBlockHeight and prevBlockHash match what is the top values we have, and if they don't we
-// invalidate the cache, because we missed some messages and cannot consider the cache coherent anymore.
-// - Clone the cache pointer (such that the previous pointer is still accessible, but new one shared the content with it),
-// apply state updates to the cloned cache pointer and save under the new identified made from blockHeight and blockHash.
-// - If there is a conditional variable corresponding to the identifier, remove it from the map and notify conditional
-// variable, waking up the read-only transaction waiting on it.
+// Pair.Value == nil - is a marker of absence key in db
 //
-// On the other hand, whenever we have a cache miss (by looking at the top cache), we do the following:
-// - Once read the current block height and block hash (canonical) from underlying db transaction
-// - Construct the identifier from the current block height and block hash
-// - Look for the constructed identifier in the cache. If the identifier is found, use the corresponding
-// cache in conjunction with this read-only transaction (it will be consistent with it). If the identifier is
-// not found, it means that the transaction has been committed in Erigon, but the state update has not
-// arrived yet (as shown in the picture on the right). Insert conditional variable for this identifier and wait on
-// it until either cache with the given identifier appears, or timeout (indicating that the cache update
-// mechanism is broken and cache is likely invalidated).
-//
-
-// Pair.Value == nil - is a marker of absense key in db
-
-// Coherent
-// High-level guaranties:
+// High-level guarantees:
 // - Keys/Values returned by cache are valid/immutable until end of db transaction
-// - CacheView is always coherent with given db transaction -
+// - CacheView is always coherent with given db transaction
 //
 // Rules of set view.isCanonical value:
 //   - method View can't parent.Clone() - because parent view is not coherent with current kv.Tx
@@ -97,33 +124,40 @@ type CacheView interface {
 //   - parent.Clone() can't be called if parent.isCanonical=false
 //   - only OnNewBlock method can set view.isCanonical=true
 //
-// Rules of filling cache.stateEvict:
-//   - changes in Canonical View SHOULD reflect in stateEvict
-//   - changes in Non-Canonical View SHOULD NOT reflect in stateEvict
+// Rules of filling eviction lists:
+//   - changes in Canonical View SHOULD reflect in eviction lists
+//   - changes in Non-Canonical View SHOULD NOT reflect in eviction lists
 type Coherent struct {
-	hasher               hash.Hash
-	codeEvictLen         metrics.Gauge
-	codeKeys             metrics.Gauge
-	keys                 metrics.Gauge
-	evict                metrics.Gauge
-	latestStateView      *CoherentRoot
-	codeMiss             metrics.Counter
-	timeout              metrics.Counter
-	hits                 metrics.Counter
-	codeHits             metrics.Counter
+	// root management (protected by rootMu)
+	rootMu               sync.Mutex
 	roots                map[uint64]*CoherentRoot
-	stateEvict           *ThreadSafeEvictionList
-	codeEvict            *ThreadSafeEvictionList
-	miss                 metrics.Counter
-	cfg                  CoherentConfig
 	latestStateVersionID uint64
-	lock                 sync.Mutex
-	waitExceededCount    atomic.Int32 // used as a circuit breaker to stop the cache waiting for new blocks
+	latestStateView      *CoherentRoot
+	waitExceededCount    atomic.Int32
+
+	// serializes OnNewBlock (protects hasher)
+	onNewBlockMu sync.Mutex
+	hasher       hash.Hash
+
+	// immutable after init
+	cfg       CoherentConfig
+	numShards uint32
+	shardMask uint32 // numShards - 1
+
+	// metrics
+	codeEvictLen metrics.Gauge
+	codeKeys     metrics.Gauge
+	keys         metrics.Gauge
+	evict        metrics.Gauge
+	codeMiss     metrics.Counter
+	timeout      metrics.Counter
+	hits         metrics.Counter
+	codeHits     metrics.Counter
+	miss         metrics.Counter
 }
 
 type CoherentRoot struct {
-	cache           *btree2.BTreeG[*Element]
-	codeCache       *btree2.BTreeG[*Element]
+	shards          []cacheShard
 	ready           chan struct{} // close when ready
 	readyChanClosed atomic.Bool   // quick check if ready channel is closed
 	closeOnce       sync.Once     // protecting `ready` field from double-close
@@ -145,13 +179,6 @@ func (c *CoherentView) GetCode(k []byte) ([]byte, error) {
 	return c.cache.GetCode(k, c.tx, c.stateVersionID)
 }
 func (c *CoherentView) HasStorage(address common.Address) (bool, error) {
-	// note: theoretically we could try to use the cache and look for populated storage
-	// slots for the given account, however that will be only useful in case of a
-	// collision (ie creating an account which already has storage as per eip-7610) which
-	// in reality is very rare; for all the other most likely situations in which we query
-	// if an account has storage (and that account is newly created and doesn't have storage)
-	// the cache will say that there is no known storage in which case we will still need to
-	// check in the DB to be absolutely sure anyway (this deems such an "optimisation" useless)
 	_, _, hasStorage, err := c.tx.HasPrefix(kv.StorageDomain, address[:])
 	return hasStorage, err
 }
@@ -159,73 +186,93 @@ func (c *CoherentView) HasStorage(address common.Address) (bool, error) {
 var _ Cache = (*Coherent)(nil)         // compile-time interface check
 var _ CacheView = (*CoherentView)(nil) // compile-time interface check
 
-const (
-	DEGREE    = 32
-	MAX_WAITS = 100
-)
-
-type CoherentConfig struct {
-	CacheSize       datasize.ByteSize
-	CodeCacheSize   datasize.ByteSize
-	WaitForNewBlock bool // should we wait 10ms for a new block message to arrive when calling View?
-	WithStorage     bool
-	MetricsLabel    string
-	NewBlockWait    time.Duration // how long wait
-	KeepViews       uint64        // keep in memory up to this amount of views, evict older
-}
-
-var DefaultCoherentConfig = CoherentConfig{
-	KeepViews:       5,
-	NewBlockWait:    5 * time.Millisecond,
-	CacheSize:       2 * datasize.GB,
-	CodeCacheSize:   2 * datasize.GB,
-	MetricsLabel:    "default",
-	WithStorage:     true,
-	WaitForNewBlock: true,
-}
-
 func New(cfg CoherentConfig) *Coherent {
 	if cfg.KeepViews == 0 {
 		panic("empty config passed")
 	}
 
+	numShards := cfg.NumShards
+	if numShards == 0 {
+		numShards = DefaultNumShards
+	}
+	if numShards&(numShards-1) != 0 {
+		panic("NumShards must be a power of 2")
+	}
+
 	return &Coherent{
-		roots:        map[uint64]*CoherentRoot{},
-		stateEvict:   &ThreadSafeEvictionList{l: NewList()},
-		codeEvict:    &ThreadSafeEvictionList{l: NewList()},
-		hasher:       sha3.NewLegacyKeccak256(),
-		cfg:          cfg,
-		miss:         metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="miss",name="%s"}`, cfg.MetricsLabel)),
-		hits:         metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="hit",name="%s"}`, cfg.MetricsLabel)),
-		timeout:      metrics.GetOrCreateCounter(fmt.Sprintf(`cache_timeout_total{name="%s"}`, cfg.MetricsLabel)),
-		keys:         metrics.GetOrCreateGauge(fmt.Sprintf(`cache_keys_total{name="%s"}`, cfg.MetricsLabel)),
-		evict:        metrics.GetOrCreateGauge(fmt.Sprintf(`cache_list_total{name="%s"}`, cfg.MetricsLabel)),
-		codeMiss:     metrics.GetOrCreateCounter(fmt.Sprintf(`cache_code_total{result="miss",name="%s"}`, cfg.MetricsLabel)),
-		codeHits:     metrics.GetOrCreateCounter(fmt.Sprintf(`cache_code_total{result="hit",name="%s"}`, cfg.MetricsLabel)),
-		codeKeys:     metrics.GetOrCreateGauge(fmt.Sprintf(`cache_code_keys_total{name="%s"}`, cfg.MetricsLabel)),
+		roots:     map[uint64]*CoherentRoot{},
+		hasher:    sha3.NewLegacyKeccak256(),
+		cfg:       cfg,
+		numShards: numShards,
+		shardMask: numShards - 1,
+		miss:      metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="miss",name="%s"}`, cfg.MetricsLabel)),
+		hits:      metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="hit",name="%s"}`, cfg.MetricsLabel)),
+		timeout:   metrics.GetOrCreateCounter(fmt.Sprintf(`cache_timeout_total{name="%s"}`, cfg.MetricsLabel)),
+		keys:      metrics.GetOrCreateGauge(fmt.Sprintf(`cache_keys_total{name="%s"}`, cfg.MetricsLabel)),
+		evict:     metrics.GetOrCreateGauge(fmt.Sprintf(`cache_list_total{name="%s"}`, cfg.MetricsLabel)),
+		codeMiss:  metrics.GetOrCreateCounter(fmt.Sprintf(`cache_code_total{result="miss",name="%s"}`, cfg.MetricsLabel)),
+		codeHits:  metrics.GetOrCreateCounter(fmt.Sprintf(`cache_code_total{result="hit",name="%s"}`, cfg.MetricsLabel)),
+		codeKeys:  metrics.GetOrCreateGauge(fmt.Sprintf(`cache_code_keys_total{name="%s"}`, cfg.MetricsLabel)),
 		codeEvictLen: metrics.GetOrCreateGauge(fmt.Sprintf(`cache_code_list_total{name="%s"}`, cfg.MetricsLabel)),
 	}
 }
 
+func (c *Coherent) newRoot() *CoherentRoot {
+	shards := make([]cacheShard, c.numShards)
+	for i := range shards {
+		shards[i] = newCacheShard()
+	}
+	return &CoherentRoot{
+		shards: shards,
+		ready:  make(chan struct{}),
+	}
+}
+
+// shardIndex returns the shard for a given key using first byte.
+// Account keys (20 bytes): first byte of address (keccak-derived, pseudo-random).
+// Storage keys (60 bytes): first byte of address.
+// Code keys (32 bytes): first byte of keccak hash (uniformly random).
+func (c *Coherent) shardIndex(k []byte) uint32 {
+	if len(k) == 0 {
+		return 0
+	}
+	return uint32(k[0]) & c.shardMask
+}
+
+// stateBudgetPerShard returns the per-shard eviction budget for state cache.
+func (c *Coherent) stateBudgetPerShard() int {
+	b := int(c.cfg.CacheSize.Bytes()) / int(c.numShards)
+	if b < 1 {
+		b = 1
+	}
+	return b
+}
+
+// codeBudgetPerShard returns the per-shard eviction budget for code cache.
+func (c *Coherent) codeBudgetPerShard() int {
+	b := int(c.cfg.CodeCacheSize.Bytes()) / int(c.numShards)
+	if b < 1 {
+		b = 1
+	}
+	return b
+}
+
 // selectOrCreateRoot - used for usual getting root
 func (c *Coherent) selectOrCreateRoot(versionID uint64) *CoherentRoot {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.rootMu.Lock()
+	defer c.rootMu.Unlock()
 	r, ok := c.roots[versionID]
 	if ok {
 		return r
 	}
 
-	r = &CoherentRoot{
-		ready:     make(chan struct{}),
-		cache:     btree2.NewBTreeG[*Element](Less),
-		codeCache: btree2.NewBTreeG[*Element](Less),
-	}
+	r = c.newRoot()
 	c.roots[versionID] = r
 	return r
 }
 
-// advanceRoot - used for advancing root onNewBlock
+// advanceRoot - used for advancing root onNewBlock.
+// Must be called with rootMu held.
 func (c *Coherent) advanceRoot(stateVersionID uint64) (r *CoherentRoot) {
 	r, rootExists := c.roots[stateVersionID]
 
@@ -235,34 +282,54 @@ func (c *Coherent) advanceRoot(stateVersionID uint64) (r *CoherentRoot) {
 	}
 
 	if !rootExists {
-		r = &CoherentRoot{ready: make(chan struct{})}
+		r = &CoherentRoot{
+			shards: make([]cacheShard, c.numShards),
+			ready:  make(chan struct{}),
+		}
 		c.roots[stateVersionID] = r
 	}
 
 	if prevView, ok := c.roots[stateVersionID-1]; ok && prevView.isCanonical {
-		//log.Info("advance: clone", "from", viewID-1, "to", viewID)
-		r.cache = prevView.cache.Copy()
-		r.codeCache = prevView.codeCache.Copy()
+		// COW clone each shard from previous canonical root
+		for i := uint32(0); i < c.numShards; i++ {
+			prevView.shards[i].mu.Lock()
+			r.shards[i].cache = prevView.shards[i].cache.Copy()
+			r.shards[i].codeCache = prevView.shards[i].codeCache.Copy()
+			prevView.shards[i].mu.Unlock()
+			// Eviction lists carry over by reference from canonical view.
+			// New elements added to this root will be tracked in these lists.
+			r.shards[i].stateEvict = prevView.shards[i].stateEvict
+			r.shards[i].codeEvict = prevView.shards[i].codeEvict
+		}
 	} else {
-		c.stateEvict.Init()
-		c.codeEvict.Init()
-		if r.cache == nil {
-			//log.Info("advance: new", "to", viewID)
-			r.cache = btree2.NewBTreeG[*Element](Less)
-			r.codeCache = btree2.NewBTreeG[*Element](Less)
-		} else {
-			r.cache.Walk(func(items []*Element) bool {
-				for _, i := range items {
-					c.stateEvict.PushFront(i)
-				}
-				return true
-			})
-			r.codeCache.Walk(func(items []*Element) bool {
-				for _, i := range items {
-					c.codeEvict.PushFront(i)
-				}
-				return true
-			})
+		for i := uint32(0); i < c.numShards; i++ {
+			if r.shards[i].stateEvict == nil {
+				r.shards[i].stateEvict = NewList()
+			} else {
+				r.shards[i].stateEvict.Init()
+			}
+			if r.shards[i].codeEvict == nil {
+				r.shards[i].codeEvict = NewList()
+			} else {
+				r.shards[i].codeEvict.Init()
+			}
+			if r.shards[i].cache == nil {
+				r.shards[i].cache = btree2.NewBTreeG[*Element](Less)
+				r.shards[i].codeCache = btree2.NewBTreeG[*Element](Less)
+			} else {
+				r.shards[i].cache.Walk(func(items []*Element) bool {
+					for _, item := range items {
+						r.shards[i].stateEvict.PushFront(item)
+					}
+					return true
+				})
+				r.shards[i].codeCache.Walk(func(items []*Element) bool {
+					for _, item := range items {
+						r.shards[i].codeEvict.PushFront(item)
+					}
+					return true
+				})
+			}
 		}
 	}
 	r.isCanonical = true
@@ -271,19 +338,32 @@ func (c *Coherent) advanceRoot(stateVersionID uint64) (r *CoherentRoot) {
 	c.latestStateVersionID = stateVersionID
 	c.latestStateView = r
 
-	c.keys.SetInt(c.latestStateView.cache.Len())
-	c.codeKeys.SetInt(c.latestStateView.codeCache.Len())
-	c.evict.SetInt(c.stateEvict.Len())
-	c.codeEvictLen.SetInt(c.codeEvict.Len())
+	// Update metrics (sum across shards)
+	totalKeys, totalCodeKeys := 0, 0
+	totalEvict, totalCodeEvict := 0, 0
+	for i := uint32(0); i < c.numShards; i++ {
+		totalKeys += r.shards[i].cache.Len()
+		totalCodeKeys += r.shards[i].codeCache.Len()
+		totalEvict += r.shards[i].stateEvict.Len()
+		totalCodeEvict += r.shards[i].codeEvict.Len()
+	}
+	c.keys.SetInt(totalKeys)
+	c.codeKeys.SetInt(totalCodeKeys)
+	c.evict.SetInt(totalEvict)
+	c.codeEvictLen.SetInt(totalCodeEvict)
 	return r
 }
 
 func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.onNewBlockMu.Lock()
+	defer c.onNewBlockMu.Unlock()
+
+	c.rootMu.Lock()
 	c.waitExceededCount.Store(0) // reset the circuit breaker
 	id := stateChanges.StateVersionId
 	r := c.advanceRoot(id)
+	latestID := c.latestStateVersionID
+	c.rootMu.Unlock()
 
 	for _, sc := range stateChanges.ChangeBatch {
 		for i := range sc.Changes {
@@ -291,19 +371,19 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 			case remoteproto.Action_UPSERT:
 				addr := gointerfaces.ConvertH160toAddress(sc.Changes[i].Address)
 				v := sc.Changes[i].Data
-				c.add(addr[:], v, r, id)
+				c.add(addr[:], v, r, id, latestID)
 			case remoteproto.Action_UPSERT_CODE:
 				addr := gointerfaces.ConvertH160toAddress(sc.Changes[i].Address)
 				v := sc.Changes[i].Data
-				c.add(addr[:], v, r, id)
+				c.add(addr[:], v, r, id, latestID)
 				c.hasher.Reset()
 				c.hasher.Write(sc.Changes[i].Code)
 				k := make([]byte, 32)
 				c.hasher.Sum(k)
-				c.addCode(k, sc.Changes[i].Code, r, id)
+				c.addCode(k, sc.Changes[i].Code, r, id, latestID)
 			case remoteproto.Action_REMOVE:
 				addr := gointerfaces.ConvertH160toAddress(sc.Changes[i].Address)
-				c.add(addr[:], nil, r, id)
+				c.add(addr[:], nil, r, id, latestID)
 			case remoteproto.Action_STORAGE:
 				//skip, will check later
 			case remoteproto.Action_CODE:
@@ -311,7 +391,7 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 				c.hasher.Write(sc.Changes[i].Code)
 				k := make([]byte, 32)
 				c.hasher.Sum(k)
-				c.addCode(k, sc.Changes[i].Code, r, id)
+				c.addCode(k, sc.Changes[i].Code, r, id, latestID)
 			default:
 				panic("not implemented yet")
 			}
@@ -323,7 +403,7 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 					copy(k, addr[:])
 					binary.BigEndian.PutUint64(k[20:], sc.Changes[i].Incarnation)
 					copy(k[20+8:], loc[:])
-					c.add(k, change.Data, r, id)
+					c.add(k, change.Data, r, id, latestID)
 				}
 			}
 		}
@@ -333,7 +413,6 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 		r.readyChanClosed.Store(true)
 		close(r.ready) // broadcast
 	})
-	//log.Info("on new block handled", "viewID", stateChanges.StateVersionID)
 }
 
 func (c *Coherent) View(ctx context.Context, tx kv.TemporalTx) (CacheView, error) {
@@ -354,48 +433,56 @@ func (c *Coherent) View(ctx context.Context, tx kv.TemporalTx) (CacheView, error
 
 	select {
 	case <-r.ready:
-		return &CoherentView{stateVersionID: id, tx: tx, cache: c}, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("kvcache rootNum=%x, %w", tx.ViewID(), ctx.Err())
 	case <-time.After(c.cfg.NewBlockWait):
 		c.timeout.Inc()
 		c.waitExceededCount.Add(1)
-		return &CoherentView{stateVersionID: id, tx: tx, cache: c}, nil
 	}
+
+	return &CoherentView{stateVersionID: id, tx: tx, cache: c}, nil
 }
 
 func (c *Coherent) getFromCache(k []byte, id uint64, domain kv.Domain) (*Element, *CoherentRoot, error) {
-	// using the full lock here rather than RLock as RLock causes a lot of calls to runtime.usleep degrading
-	// performance under load
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
+	// Brief lock on rootMu to find the root
+	c.rootMu.Lock()
 	r, ok := c.roots[id]
 	if !ok {
-		return nil, r, fmt.Errorf("too old ViewID: %d, latestStateVersionID=%d", id, c.latestStateVersionID)
+		latestID := c.latestStateVersionID
+		c.rootMu.Unlock()
+		return nil, nil, fmt.Errorf("too old ViewID: %d, latestStateVersionID=%d", id, latestID)
 	}
 	isLatest := c.latestStateVersionID == id
+	c.rootMu.Unlock()
 
+	// Shard-local lookup (no global contention)
+	si := c.shardIndex(k)
+	shard := &r.shards[si]
+
+	shard.mu.Lock()
 	var it *Element
 	if domain == kv.CodeDomain {
-		it, _ = r.codeCache.Get(&Element{K: k})
+		it, _ = shard.codeCache.Get(&Element{K: k})
+		if it != nil && isLatest {
+			shard.codeEvict.MoveToFront(it)
+		}
 	} else {
-		it, _ = r.cache.Get(&Element{K: k})
+		it, _ = shard.cache.Get(&Element{K: k})
+		if it != nil && isLatest {
+			shard.stateEvict.MoveToFront(it)
+		}
 	}
-	if it != nil && isLatest {
-		c.stateEvict.MoveToFront(it)
-	}
+	shard.mu.Unlock()
+
 	return it, r, nil
 }
+
 func (c *Coherent) Get(k []byte, tx kv.TemporalTx, id uint64) (v []byte, err error) {
-	//TODO: Get must accept from user Domain parameter
 	it, r, err := c.getFromCache(k, id, kv.AccountsDomain)
 	if err != nil {
 		return nil, err
 	}
 
 	if it != nil {
-		//fmt.Printf("from cache:  %#x,%x\n", k, it.(*Element).V)
 		c.hits.Inc()
 		return it.V, nil
 	}
@@ -413,12 +500,12 @@ func (c *Coherent) Get(k []byte, tx kv.TemporalTx, id uint64) (v []byte, err err
 	if len(v) == 0 {
 		return v, nil
 	}
-	//fmt.Printf("from db: %#x,%x\n", k, v)
-	c.lock.Lock()
 
-	defer c.lock.Unlock()
+	c.rootMu.Lock()
+	latestID := c.latestStateVersionID
+	c.rootMu.Unlock()
 
-	v = c.add(common.Copy(k), common.Copy(v), r, id).V
+	v = c.add(common.Copy(k), common.Copy(v), r, id, latestID).V
 	return v, nil
 }
 
@@ -427,75 +514,83 @@ func (c *Coherent) GetCode(k []byte, tx kv.TemporalTx, id uint64) (v []byte, err
 	if err != nil {
 		return nil, err
 	}
-
 	if it != nil {
-		//fmt.Printf("from cache:  %#x,%x\n", k, it.(*Element).V)
 		c.codeHits.Inc()
 		return it.V, nil
 	}
-	c.codeMiss.Inc()
 
+	c.codeMiss.Inc()
 	v, _, err = tx.GetLatest(kv.CodeDomain, k)
 	if err != nil {
 		return nil, err
 	}
-	//fmt.Printf("from db: %#x,%x\n", k, v)
+	if len(v) == 0 {
+		return v, nil
+	}
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	v = c.addCode(common.Copy(k), common.Copy(v), r, id).V
+	c.rootMu.Lock()
+	latestID := c.latestStateVersionID
+	c.rootMu.Unlock()
+
+	v = c.addCode(common.Copy(k), common.Copy(v), r, id, latestID).V
 	return v, nil
 }
-func (c *Coherent) removeOldest(r *CoherentRoot) {
-	e := c.stateEvict.Oldest()
-	if e != nil {
-		c.stateEvict.Remove(e)
-		r.cache.Delete(e)
-	}
-}
-func (c *Coherent) removeOldestCode(r *CoherentRoot) {
-	e := c.codeEvict.Oldest()
-	if e != nil {
-		c.codeEvict.Remove(e)
-		r.codeCache.Delete(e)
-	}
-}
-func (c *Coherent) add(k, v []byte, r *CoherentRoot, id uint64) *Element {
+
+func (c *Coherent) add(k, v []byte, r *CoherentRoot, id, latestID uint64) *Element {
+	si := c.shardIndex(k)
+	shard := &r.shards[si]
+
 	it := &Element{K: k, V: v}
 
-	replaced, _ := r.cache.Set(it)
-	if c.latestStateVersionID != id {
-		//fmt.Printf("add to non-last viewID: %d<%d\n", c.latestViewID, id)
+	shard.mu.Lock()
+	replaced, _ := shard.cache.Set(it)
+	if latestID != id {
+		shard.mu.Unlock()
 		return it
 	}
 	if replaced != nil {
-		c.stateEvict.Remove(replaced)
+		shard.stateEvict.Remove(replaced)
 	}
-	c.stateEvict.PushFront(it)
+	shard.stateEvict.PushFront(it)
 
-	// clear down cache until size below the configured limit
-	for c.stateEvict.Size() > int(c.cfg.CacheSize.Bytes()) {
-		c.removeOldest(r)
+	budget := c.stateBudgetPerShard()
+	for shard.stateEvict.Size() > budget {
+		e := shard.stateEvict.Back()
+		if e != nil {
+			shard.stateEvict.Remove(e)
+			shard.cache.Delete(e)
+		}
 	}
-
+	shard.mu.Unlock()
 	return it
 }
-func (c *Coherent) addCode(k, v []byte, r *CoherentRoot, id uint64) *Element {
+
+func (c *Coherent) addCode(k, v []byte, r *CoherentRoot, id, latestID uint64) *Element {
+	si := c.shardIndex(k)
+	shard := &r.shards[si]
+
 	it := &Element{K: k, V: v}
-	replaced, _ := r.codeCache.Set(it)
-	if c.latestStateVersionID != id {
-		//fmt.Printf("add to non-last viewID: %d<%d\n", c.latestViewID, id)
+
+	shard.mu.Lock()
+	replaced, _ := shard.codeCache.Set(it)
+	if latestID != id {
+		shard.mu.Unlock()
 		return it
 	}
 	if replaced != nil {
-		c.codeEvict.Remove(replaced)
+		shard.codeEvict.Remove(replaced)
 	}
-	c.codeEvict.PushFront(it)
+	shard.codeEvict.PushFront(it)
 
-	for c.codeEvict.Size() > int(c.cfg.CodeCacheSize.Bytes()) {
-		c.removeOldestCode(r)
+	budget := c.codeBudgetPerShard()
+	for shard.codeEvict.Size() > budget {
+		e := shard.codeEvict.Back()
+		if e != nil {
+			shard.codeEvict.Remove(e)
+			shard.codeCache.Delete(e)
+		}
 	}
-
+	shard.mu.Unlock()
 	return it
 }
 
@@ -520,14 +615,16 @@ func (c *Coherent) ValidateCurrentRoot(ctx context.Context, tx kv.TemporalTx) (*
 
 	result.LatestStateID = stateID
 
-	// if the latest view id in the cache is not the same as the tx or one below it
-	// then the cache will be a new one for the next call so return early
-	if stateID > c.latestStateVersionID {
+	c.rootMu.Lock()
+	latestID := c.latestStateVersionID
+	c.rootMu.Unlock()
+
+	if stateID > latestID {
 		result.LatestStateBehind = true
 		return result, nil
 	}
 
-	root := c.selectOrCreateRoot(c.latestStateVersionID)
+	root := c.selectOrCreateRoot(latestID)
 
 	// ensure the root is ready or wait and press on
 	select {
@@ -575,9 +672,30 @@ func (c *Coherent) ValidateCurrentRoot(ctx context.Context, tx kv.TemporalTx) (*
 		return false, keys, nil
 	}
 
-	cache, codeCache := c.cloneCaches(root)
+	stateCaches, codeCaches := c.cloneCaches(root)
 
-	cancelled, keys, err := compare(cache, kv.AccountsDomain)
+	// Merge all state shard clones into one for comparison
+	mergedState := btree2.NewBTreeG[*Element](Less)
+	for _, sc := range stateCaches {
+		sc.Walk(func(items []*Element) bool {
+			for _, item := range items {
+				mergedState.Set(item)
+			}
+			return true
+		})
+	}
+
+	mergedCode := btree2.NewBTreeG[*Element](Less)
+	for _, cc := range codeCaches {
+		cc.Walk(func(items []*Element) bool {
+			for _, item := range items {
+				mergedCode.Set(item)
+			}
+			return true
+		})
+	}
+
+	cancelled, keys, err := compare(mergedState, kv.AccountsDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -587,7 +705,18 @@ func (c *Coherent) ValidateCurrentRoot(ctx context.Context, tx kv.TemporalTx) (*
 		return result, nil
 	}
 
-	cancelled, keys, err = compare(cache, kv.StorageDomain)
+	// Note: the original code called compare twice on `cache` for accounts and storage.
+	// We preserve the same behavior.
+	mergedState2 := btree2.NewBTreeG[*Element](Less)
+	for _, sc := range stateCaches {
+		sc.Walk(func(items []*Element) bool {
+			for _, item := range items {
+				mergedState2.Set(item)
+			}
+			return true
+		})
+	}
+	cancelled, keys, err = compare(mergedState2, kv.StorageDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +726,7 @@ func (c *Coherent) ValidateCurrentRoot(ctx context.Context, tx kv.TemporalTx) (*
 		return result, nil
 	}
 
-	cancelled, keys, err = compare(codeCache, kv.CodeDomain)
+	cancelled, keys, err = compare(mergedCode, kv.CodeDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -615,19 +744,25 @@ func (c *Coherent) ValidateCurrentRoot(ctx context.Context, tx kv.TemporalTx) (*
 	return result, nil
 }
 
-func (c *Coherent) cloneCaches(r *CoherentRoot) (cache *btree2.BTreeG[*Element], codeCache *btree2.BTreeG[*Element]) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	cache = r.cache.Copy()
-	codeCache = r.codeCache.Copy()
-	return cache, codeCache
+func (c *Coherent) cloneCaches(r *CoherentRoot) (stateCaches, codeCaches []*btree2.BTreeG[*Element]) {
+	stateCaches = make([]*btree2.BTreeG[*Element], c.numShards)
+	codeCaches = make([]*btree2.BTreeG[*Element], c.numShards)
+	for i := uint32(0); i < c.numShards; i++ {
+		r.shards[i].mu.Lock()
+		stateCaches[i] = r.shards[i].cache.Copy()
+		codeCaches[i] = r.shards[i].codeCache.Copy()
+		r.shards[i].mu.Unlock()
+	}
+	return
 }
 
 func (c *Coherent) clearCaches(r *CoherentRoot) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	r.cache.Clear()
-	r.codeCache.Clear()
+	for i := range r.shards {
+		r.shards[i].mu.Lock()
+		r.shards[i].cache.Clear()
+		r.shards[i].codeCache.Clear()
+		r.shards[i].mu.Unlock()
+	}
 }
 
 type Stat struct {
@@ -642,17 +777,22 @@ func DebugStats(cache Cache) []Stat {
 	if !ok {
 		return res
 	}
-	casted.lock.Lock()
+	casted.rootMu.Lock()
 	for root, r := range casted.roots {
+		totalLen := 0
+		for i := range r.shards {
+			totalLen += r.shards[i].cache.Len()
+		}
 		res = append(res, Stat{
 			BlockNum: root,
-			Lenght:   r.cache.Len(),
+			Lenght:   totalLen,
 		})
 	}
-	casted.lock.Unlock()
+	casted.rootMu.Unlock()
 	sort.Slice(res, func(i, j int) bool { return res[i].BlockNum < res[j].BlockNum })
 	return res
 }
+
 func AssertCheckValues(ctx context.Context, tx kv.TemporalTx, cache Cache) (int, error) {
 	defer func(t time.Time) { fmt.Printf("AssertCheckValues:327: %s\n", time.Since(t)) }(time.Now())
 	view, err := cache.View(ctx, tx)
@@ -668,31 +808,38 @@ func AssertCheckValues(ctx context.Context, tx kv.TemporalTx, cache Cache) (int,
 		return 0, nil
 	}
 	checked := 0
-	casted.lock.Lock()
-	defer casted.lock.Unlock()
-	//log.Info("AssertCheckValues start", "db_id", tx.ViewID(), "mem_id", casted.id.Load(), "len", casted.cache.Len())
+	casted.rootMu.Lock()
 	root, ok := casted.roots[castedView.stateVersionID]
+	casted.rootMu.Unlock()
 	if !ok {
 		return 0, nil
 	}
-	root.cache.Walk(func(items []*Element) bool {
-		for _, i := range items {
-			k, v := i.K, i.V
-			var dbV []byte
-			dbV, err = tx.GetOne(kv.PlainState, k)
-			if err != nil {
-				return false
+	for si := range root.shards {
+		root.shards[si].mu.Lock()
+		root.shards[si].cache.Walk(func(items []*Element) bool {
+			for _, item := range items {
+				k, v := item.K, item.V
+				var dbV []byte
+				dbV, err = tx.GetOne(kv.PlainState, k)
+				if err != nil {
+					return false
+				}
+				if !bytes.Equal(dbV, v) {
+					err = fmt.Errorf("key: %x, has different values: %x != %x", k, v, dbV)
+					return false
+				}
+				checked++
 			}
-			if !bytes.Equal(dbV, v) {
-				err = fmt.Errorf("key: %x, has different values: %x != %x", k, v, dbV)
-				return false
-			}
-			checked++
+			return true
+		})
+		root.shards[si].mu.Unlock()
+		if err != nil {
+			return checked, err
 		}
-		return true
-	})
+	}
 	return checked, err
 }
+
 func (c *Coherent) evictRoots() {
 	if c.latestStateVersionID <= c.cfg.KeepViews {
 		return
@@ -708,18 +855,77 @@ func (c *Coherent) evictRoots() {
 		}
 		toDel = append(toDel, txID)
 	}
-	//log.Info("forget old roots", "list", fmt.Sprintf("%d", toDel))
 	for _, txID := range toDel {
 		delete(c.roots, txID)
 	}
 }
+
 func (c *Coherent) Len() int {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if c.latestStateView == nil {
+	c.rootMu.Lock()
+	r := c.latestStateView
+	c.rootMu.Unlock()
+	if r == nil {
 		return 0
 	}
-	return c.latestStateView.cache.Len() //todo: is it same with cache.len()?
+	return c.latestStateViewLen()
+}
+
+// Test helpers (unexported, for use in tests within this package)
+
+func (c *Coherent) totalStateEvictLen() int {
+	c.rootMu.Lock()
+	r := c.latestStateView
+	c.rootMu.Unlock()
+	if r == nil {
+		return 0
+	}
+	total := 0
+	for i := range r.shards {
+		total += r.shards[i].stateEvict.Len()
+	}
+	return total
+}
+
+func (c *Coherent) totalStateEvictSize() int {
+	c.rootMu.Lock()
+	r := c.latestStateView
+	c.rootMu.Unlock()
+	if r == nil {
+		return 0
+	}
+	total := 0
+	for i := range r.shards {
+		total += r.shards[i].stateEvict.Size()
+	}
+	return total
+}
+
+func (c *Coherent) totalCodeEvictLen() int {
+	c.rootMu.Lock()
+	r := c.latestStateView
+	c.rootMu.Unlock()
+	if r == nil {
+		return 0
+	}
+	total := 0
+	for i := range r.shards {
+		total += r.shards[i].codeEvict.Len()
+	}
+	return total
+}
+
+func (c *Coherent) latestStateViewLen() int {
+	c.rootMu.Lock()
+	r := c.latestStateView
+	c.rootMu.Unlock()
+	if r == nil {
+		return 0
+	}
+	total := 0
+	for i := range r.shards {
+		total += r.shards[i].cache.Len()
+	}
+	return total
 }
 
 // Element is an element of a linked list.
@@ -741,55 +947,6 @@ type Element struct {
 func (e *Element) Size() int { return len(e.K) + len(e.V) }
 
 func Less(a, b *Element) bool { return bytes.Compare(a.K, b.K) < 0 }
-
-type ThreadSafeEvictionList struct {
-	l    *List
-	lock sync.Mutex
-}
-
-func (l *ThreadSafeEvictionList) Init() {
-	l.lock.Lock()
-	l.l.Init()
-	l.lock.Unlock()
-}
-func (l *ThreadSafeEvictionList) PushFront(e *Element) {
-	l.lock.Lock()
-	l.l.PushFront(e)
-	l.lock.Unlock()
-}
-
-func (l *ThreadSafeEvictionList) MoveToFront(e *Element) {
-	l.lock.Lock()
-	l.l.MoveToFront(e)
-	l.lock.Unlock()
-}
-
-func (l *ThreadSafeEvictionList) Remove(e *Element) {
-	l.lock.Lock()
-	l.l.Remove(e)
-	l.lock.Unlock()
-}
-
-func (l *ThreadSafeEvictionList) Oldest() *Element {
-	l.lock.Lock()
-	e := l.l.Back()
-	l.lock.Unlock()
-	return e
-}
-
-func (l *ThreadSafeEvictionList) Len() int {
-	l.lock.Lock()
-	length := l.l.Len()
-	l.lock.Unlock()
-	return length
-}
-
-func (l *ThreadSafeEvictionList) Size() int {
-	l.lock.Lock()
-	size := l.l.Size()
-	l.lock.Unlock()
-	return size
-}
 
 // ========= copypaste of List implementation from stdlib ========
 
