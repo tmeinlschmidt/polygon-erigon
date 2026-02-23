@@ -128,6 +128,14 @@ func (sd *TemporalMemBatch) GetLatest(table kv.Domain, key []byte) (v []byte, pr
 	return dataWithPrevStep.data, dataWithPrevStep.prevStep, ok
 }
 
+// ReadsValid checks if the given read set is still valid against the current
+// in-memory state. Returns true if no conflicts are detected.
+// TODO: implement actual conflict detection logic.
+func (sd *TemporalMemBatch) ReadsValid(readLists map[string]*KvList) bool {
+	return false
+}
+
+
 func (sd *TemporalMemBatch) SizeEstimate() uint64 {
 	sd.latestStateLock.RLock()
 	defer sd.latestStateLock.RUnlock()

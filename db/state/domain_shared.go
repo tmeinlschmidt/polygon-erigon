@@ -246,6 +246,13 @@ func (sd *SharedDomains) GetLatest(domain kv.Domain, tx kv.TemporalTx, k []byte)
 	return v, step, nil
 }
 
+// ReadsValid checks if the given read set is still valid against the current
+// in-memory state. Returns true if no conflicts are detected.
+func (sd *SharedDomains) ReadsValid(readLists map[string]*KvList) bool {
+	return sd.mem.ReadsValid(readLists)
+}
+
+
 // DomainPut
 // Optimizations:
 //   - user can provide `prevVal != nil` - then it will not read prev value from storage
