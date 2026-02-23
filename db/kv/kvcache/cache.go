@@ -290,16 +290,32 @@ func (c *Coherent) advanceRoot(stateVersionID uint64) (r *CoherentRoot) {
 	}
 
 	if prevView, ok := c.roots[stateVersionID-1]; ok && prevView.isCanonical {
-		// COW clone each shard from previous canonical root
+		// COW clone each shard from previous canonical root.
+		// Each new root gets its own eviction lists to avoid data races:
+		// old and new roots have separate shard mutexes, so sharing eviction
+		// lists would allow concurrent unsynchronized access.
+		// The Walk+PushFront below transfers element ownership to the new
+		// eviction lists under the old shard lock, so any concurrent reader
+		// on the old root is serialized.
 		for i := uint32(0); i < c.numShards; i++ {
 			prevView.shards[i].mu.Lock()
 			r.shards[i].cache = prevView.shards[i].cache.Copy()
 			r.shards[i].codeCache = prevView.shards[i].codeCache.Copy()
+			r.shards[i].stateEvict = NewList()
+			r.shards[i].codeEvict = NewList()
+			r.shards[i].cache.Walk(func(items []*Element) bool {
+				for _, item := range items {
+					r.shards[i].stateEvict.PushFront(item)
+				}
+				return true
+			})
+			r.shards[i].codeCache.Walk(func(items []*Element) bool {
+				for _, item := range items {
+					r.shards[i].codeEvict.PushFront(item)
+				}
+				return true
+			})
 			prevView.shards[i].mu.Unlock()
-			// Eviction lists carry over by reference from canonical view.
-			// New elements added to this root will be tracked in these lists.
-			r.shards[i].stateEvict = prevView.shards[i].stateEvict
-			r.shards[i].codeEvict = prevView.shards[i].codeEvict
 		}
 	} else {
 		for i := uint32(0); i < c.numShards; i++ {
@@ -451,7 +467,6 @@ func (c *Coherent) getFromCache(k []byte, id uint64, domain kv.Domain) (*Element
 		c.rootMu.Unlock()
 		return nil, nil, fmt.Errorf("too old ViewID: %d, latestStateVersionID=%d", id, latestID)
 	}
-	isLatest := c.latestStateVersionID == id
 	c.rootMu.Unlock()
 
 	// Shard-local lookup (no global contention)
@@ -462,14 +477,8 @@ func (c *Coherent) getFromCache(k []byte, id uint64, domain kv.Domain) (*Element
 	var it *Element
 	if domain == kv.CodeDomain {
 		it, _ = shard.codeCache.Get(&Element{K: k})
-		if it != nil && isLatest {
-			shard.codeEvict.MoveToFront(it)
-		}
 	} else {
 		it, _ = shard.cache.Get(&Element{K: k})
-		if it != nil && isLatest {
-			shard.stateEvict.MoveToFront(it)
-		}
 	}
 	shard.mu.Unlock()
 
