@@ -17,6 +17,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -130,9 +131,60 @@ func (sd *TemporalMemBatch) GetLatest(table kv.Domain, key []byte) (v []byte, pr
 
 // ReadsValid checks if the given read set is still valid against the current
 // in-memory state. Returns true if no conflicts are detected.
-// TODO: implement actual conflict detection logic.
+// For each key in readLists, if the key exists in the in-memory state and
+// its current value differs from the read value, a conflict is detected.
+// Keys not present in memory are skipped (unchanged since last flush).
 func (sd *TemporalMemBatch) ReadsValid(readLists map[string]*KvList) bool {
-	return false
+	sd.latestStateLock.RLock()
+	defer sd.latestStateLock.RUnlock()
+
+	for table, list := range readLists {
+		if list == nil {
+			continue
+		}
+		switch table {
+		case kv.AccountsDomain.String():
+			m := sd.domains[kv.AccountsDomain]
+			for i, key := range list.Keys {
+				if val, ok := m[key]; ok {
+					if !bytes.Equal(list.Vals[i], val.data) {
+						return false
+					}
+				}
+			}
+		case kv.StorageDomain.String():
+			for i, key := range list.Keys {
+				if val, ok := sd.storage.Get(key); ok {
+					if !bytes.Equal(list.Vals[i], val.data) {
+						return false
+					}
+				}
+			}
+		case kv.CodeDomain.String():
+			m := sd.domains[kv.CodeDomain]
+			for i, key := range list.Keys {
+				if val, ok := m[key]; ok {
+					if !bytes.Equal(list.Vals[i], val.data) {
+						return false
+					}
+				}
+			}
+		case CodeSizeTableFake:
+			m := sd.domains[kv.CodeDomain]
+			for i, key := range list.Keys {
+				if val, ok := m[key]; ok {
+					if len(list.Vals[i]) != 8 {
+						return false
+					}
+					readSize := binary.BigEndian.Uint64(list.Vals[i])
+					if readSize != uint64(len(val.data)) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
 }
 
 
