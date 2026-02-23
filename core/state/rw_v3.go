@@ -273,7 +273,11 @@ func (rs *ParallelExecutionState) SizeEstimate() (r uint64) {
 }
 
 func (rs *ParallelExecutionState) ReadsValid(readLists map[string]*dbstate.KvList) bool {
-	return rs.domains.ReadsValid(readLists)
+	// TODO: the underlying ReadsValid implementation is correct (see TemporalMemBatch.ReadsValid),
+	// but enabling it activates the parallel execution path in exec3_parallel.go which has
+	// pre-existing bugs (nonce corruption on mainnet). Keep disabled until parallel execution
+	// is independently debugged and tested.
+	return false
 }
 
 // StateWriterBufferedV3 - used by parallel workers to accumulate updates and then send them to conflict-resolution.
